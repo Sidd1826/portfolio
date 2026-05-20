@@ -1,0 +1,25 @@
+2026-05-19 11:53:51 [INFO    ] upi - UPIClient ready | login=https://upi-uat-mob.hsbc.co.in/sha/api/auth/login | secure=https://upi-uat-mob.hsbc.co.in/mha/secure/sha/check
+2026-05-19 11:53:51 [INFO    ] hsbc_client - HSBCHubClient ready | txn=https://cbil-in-hbap-hub-dd-trans-history-enq-3.hsbc-cbsa-hub-cert.svc.apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc/api/ | hold=https://cbil-in-hbap-hub-add-acct-hld-pst-2.hsbc-cbsa-hub-cert.svc.aplapg02.shp.ape1.pre-prod.aws.cloud.hsbc/api/accounts/apply-account-holds | dda=https://cbil-in-hbap-hub-demand-deposit-acct-enq-5.hsbc-cbsa-hub-cert.svc.aplapg02.shp.ape1.pre-prod.aws.cloud.hsbc/api/v5/accounts/demand-deposit-account
+2026-05-19 11:53:51 [INFO    ] routes.upi - [885ff8f7-1e74-4af6-a2ef-a669f46f0ec3] POST /api/v1/upi/secure | keys=['upiId', 'amount']
+2026-05-19 11:53:51 [INFO    ] upi - send_secure called with payload keys: ['upiId', 'amount']
+2026-05-19 11:53:51 [INFO    ] upi - Token missing or expiring – fetching fresh token
+2026-05-19 11:53:51 [INFO    ] upi - POST https://upi-uat-mob.hsbc.co.in/sha/api/auth/login
+2026-05-19 11:53:51 [INFO    ] upi - Login response: HTTP 200
+2026-05-19 11:53:51 [INFO    ] upi - Token extracted from field 'token'
+2026-05-19 11:53:51 [INFO    ] upi - Token cached (expires_at=1779192531)
+2026-05-19 11:53:51 [INFO    ] upi - POST https://upi-uat-mob.hsbc.co.in/mha/secure/sha/check
+2026-05-19 11:53:51 [INFO    ] upi - Secure response: HTTP 200
+2026-05-19 11:53:51 [INFO    ] upi - Decrypting response field 'responseMsg'
+2026-05-19 11:53:51 [INFO    ] routes.upi - [885ff8f7-1e74-4af6-a2ef-a669f46f0ec3] UPI secure success
+2026-05-19 11:53:51 [INFO    ] routes.transactions - [f2a80463-0f4a-4895-8a7c-a28e0e45a6ef] GET /api/v1/transactions/history | account=INHSBC001 from=None to=None
+2026-05-19 11:53:51 [INFO    ] hsbc_client - GET https://cbil-in-hbap-hub-dd-trans-history-enq-3.hsbc-cbsa-hub-cert.svc.apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc/api/ params={'accountNumber': 'INHSBC001'}
+2026-05-19 11:53:51 [INFO    ] hsbc_client - Transaction history response: HTTP 200
+2026-05-19 11:53:51 [INFO    ] routes.transactions - [f2a80463-0f4a-4895-8a7c-a28e0e45a6ef] Transaction history success
+2026-05-19 11:53:51 [INFO    ] routes.accounts - [db057190-5f9d-492d-9a9b-146e9c199672] POST /api/v1/accounts/apply-hold | account=INHSBC011019072006 amount=28.28
+2026-05-19 11:53:51 [INFO    ] hsbc_client - POST https://cbil-in-hbap-hub-add-acct-hld-pst-2.hsbc-cbsa-hub-cert.svc.aplapg02.shp.ape1.pre-prod.aws.cloud.hsbc/api/accounts/apply-account-holds | accountNumber=INHSBC011019072006
+2026-05-19 11:53:51 [INFO    ] hsbc_client - Apply account hold response: HTTP 200
+2026-05-19 11:53:51 [INFO    ] routes.accounts - [db057190-5f9d-492d-9a9b-146e9c199672] Apply account hold success
+2026-05-19 11:53:51 [INFO    ] routes.accounts - [1fdf3ac9-619d-4204-8a21-53daf4a55668] GET /api/v1/accounts/demand-deposit | hubCustomerNumber=1111
+2026-05-19 11:53:51 [INFO    ] hsbc_client - GET https://cbil-in-hbap-hub-demand-deposit-acct-enq-5.hsbc-cbsa-hub-cert.svc.aplapg02.shp.ape1.pre-prod.aws.cloud.hsbc/api/v5/accounts/demand-deposit-account | hubCustomerNumber=1111
+2026-05-19 11:53:51 [INFO    ] hsbc_client - Demand deposit account response: HTTP 200
+2026-05-19 11:53:51 [INFO    ] routes.accounts - [1fdf3ac9-619d-4204-8a21-53daf4a55668] Demand deposit account enquiry success

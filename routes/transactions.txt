@@ -1,0 +1,75 @@
+"""
+routes/transactions.py - Transaction History Enquiry route.
+"""
+from __future__ import annotations
+
+import uuid
+from typing import Any, Optional
+
+from fastapi import APIRouter, Header, HTTPException, Query, Request
+
+from hsbc_client import HSBCError, HSBCHubClient
+from logger import get_logger
+
+logger = get_logger(__name__)
+router = APIRouter(prefix="/transactions", tags=["Transactions"])
+
+
+@router.get("/history", summary="Transaction history enquiry")
+async def get_transaction_history(
+    request: Request,
+    # Query params (add more as HSBC spec requires)
+    account_number:   Optional[str] = Query(default=None, alias="accountNumber"),
+    from_date:        Optional[str] = Query(default=None, alias="fromDate",   description="YYYY-MM-DD"),
+    to_date:          Optional[str] = Query(default=None, alias="toDate",     description="YYYY-MM-DD"),
+    # HSBC override headers (optional - defaults come from config/env)
+    x_request_id:         Optional[str] = Header(default=None, alias="X-Request-ID"),
+    x_session_id:         Optional[str] = Header(default=None, alias="X-Session-ID"),
+    x_staff_user_id:      Optional[str] = Header(default=None, alias="X-Staff-User-Id"),
+    x_user_id:            Optional[str] = Header(default=None, alias="X-User-Id"),
+    x_gbgf:               Optional[str] = Header(default=None, alias="X-GBGF"),
+    x_global_channel_id:  Optional[str] = Header(default=None, alias="X-Global-Channel-Id"),
+    x_sensitive_data:     Optional[str] = Header(default=None, alias="X-Sensitive-Data"),
+):
+    req_id = x_request_id or str(uuid.uuid4())
+    logger.info(
+        "[%s] GET /api/v1/transactions/history | account=%s from=%s to=%s",
+        req_id, account_number, from_date, to_date,
+    )
+
+    hub: HSBCHubClient = request.app.state.hsbc
+
+    # Build query params to forward to HSBC
+    query_params: dict[str, str] = {}
+    if account_number:
+        query_params["accountNumber"] = account_number
+    if from_date:
+        query_params["fromDate"] = from_date
+    if to_date:
+        query_params["toDate"] = to_date
+
+    try:
+        result = await hub.get_transaction_history(
+            request_correlation_id=req_id,
+            session_correlation_id=x_session_id,
+            staff_user_id=x_staff_user_id,
+            user_id=x_user_id,
+            gbgf=x_gbgf,
+            global_channel_id=x_global_channel_id,
+            sensitive_data=x_sensitive_data,
+            query_params=query_params,
+        )
+        logger.info("[%s] Transaction history success", req_id)
+        return {"requestId": req_id, "data": result}
+
+    except HSBCError as e:
+        logger.error("[%s] HSBC error: %s | upstream=%s", req_id, e, e.upstream_status)
+        raise HTTPException(
+            status_code=e.status_code,
+            detail={
+                "requestId":      req_id,
+                "error":          "upstream_error",
+                "message":        str(e),
+                "upstreamStatus": e.upstream_status,
+            },
+        )

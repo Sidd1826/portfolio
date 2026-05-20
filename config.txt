@@ -1,0 +1,74 @@
+"""
+config.py - All configuration from environment variables.
+Copy .env.example to .env and fill in your values.
+"""
+import os
+
+# ---------------------------------------------------------------------------
+# UPI Secure API
+# ---------------------------------------------------------------------------
+UPI_BASE_URL    = os.getenv("UPI_BASE_URL",    "https://upi-uat-mob.hsbc.co.in")
+UPI_LOGIN_PATH  = os.getenv("UPI_LOGIN_PATH",  "/sha/api/auth/login")
+UPI_SECURE_PATH = os.getenv("UPI_SECURE_PATH", "/mha/secure/sha/check")
+UPI_USERNAME    = os.getenv("UPI_USERNAME",    "")
+UPI_PASSWORD    = os.getenv("UPI_PASSWORD",    "")
+UPI_AES_KEY_HEX = os.getenv("UPI_AES_KEY_HEX","")
+
+# ---------------------------------------------------------------------------
+# HSBC Hub APIs (shared base + headers)
+# ---------------------------------------------------------------------------
+
+# Transaction History
+TXN_HISTORY_BASE_URL = os.getenv(
+    "TXN_HISTORY_BASE_URL",
+    "https://cbil-in-hbap-hub-dd-trans-history-enq-3.hsbc-cbsa-hub-cert.svc.apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc",
+)
+TXN_HISTORY_PATH = os.getenv("TXN_HISTORY_PATH", "/api/")
+
+# Account Hold
+ACCT_HOLD_BASE_URL = os.getenv(
+    "ACCT_HOLD_BASE_URL",
+    "https://cbil-in-hbap-hub-add-acct-hld-pst-2.hsbc-cbsa-hub-cert.svc.aplapg02.shp.ape1.pre-prod.aws.cloud.hsbc",
+)
+ACCT_HOLD_PATH = os.getenv("ACCT_HOLD_PATH", "/api/accounts/apply-account-holds")
+
+# Demand Deposit Account Enquiry
+DDA_BASE_URL = os.getenv(
+    "DDA_BASE_URL",
+    "https://cbil-in-hbap-hub-demand-deposit-acct-enq-5.hsbc-cbsa-hub-cert.svc.aplapg02.shp.ape1.pre-prod.aws.cloud.hsbc",
+)
+DDA_PATH = os.getenv("DDA_PATH", "/api/v5/accounts/demand-deposit-account")
+
+# ---------------------------------------------------------------------------
+# HSBC Common Header Values
+# ---------------------------------------------------------------------------
+HSBC_CB_CLIENT_ID       = os.getenv("HSBC_CB_CLIENT_ID",       "SBI")
+HSBC_CB_CLIENT_SECRET   = os.getenv("HSBC_CB_CLIENT_SECRET",   "SBI11")
+HSBC_CB_STAFF_USER_ID   = os.getenv("HSBC_CB_STAFF_USER_ID",   "AP19")
+HSBC_CHNL_COUNTRY_CODE  = os.getenv("HSBC_CHNL_COUNTRY_CODE",  "IN")
+HSBC_CHNL_GROUP_MEMBER  = os.getenv("HSBC_CHNL_GROUP_MEMBER",  "HSBC")
+HSBC_CLIENT_ID          = os.getenv("HSBC_CLIENT_ID",          "SBI11")
+HSBC_CLIENT_SECRET      = os.getenv("HSBC_CLIENT_SECRET",      "WEB")
+HSBC_CONSUMER_ID        = os.getenv("HSBC_CONSUMER_ID",        "INHSBC_HUB_MHA")
+HSBC_E2E_TRUST_TOKEN    = os.getenv("HSBC_E2E_TRUST_TOKEN",    "")
+HSBC_GBGF               = os.getenv("HSBC_GBGF",               "WPB")
+HSBC_GLOBAL_CHANNEL_ID  = os.getenv("HSBC_GLOBAL_CHANNEL_ID",  "STAFFWEB")
+HSBC_SOURCE_SYSTEM_ID   = os.getenv("HSBC_SOURCE_SYSTEM_ID",   "237139")
+HSBC_SRC_DEVICE_ID      = os.getenv("HSBC_SRC_DEVICE_ID",      "255.255.222.222")
+HSBC_SRC_USER_AGENT     = os.getenv("HSBC_SRC_USER_AGENT",     "Mozilla")
+HSBC_TARGET_SYSTEM_ENV  = os.getenv("HSBC_TARGET_SYSTEM_ENV",  "F1SYS")
+HSBC_USER_ID            = os.getenv("HSBC_USER_ID",            "API9")
+HSBC_WORKSTATION_ID     = os.getenv("HSBC_WORKSTATION_ID",     "API9")
+
+# ---------------------------------------------------------------------------
+# HTTP Client
+# ---------------------------------------------------------------------------
+HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT",   "5"))
+HTTP_READ_TIMEOUT    = float(os.getenv("HTTP_READ_TIMEOUT",      "30"))
+HTTP_RETRIES         = int(os.getenv("HTTP_RETRIES",             "2"))
+
+# ---------------------------------------------------------------------------
+# Token Cache (UPI)
+# ---------------------------------------------------------------------------
+TOKEN_REFRESH_LEEWAY = int(os.getenv("TOKEN_REFRESH_LEEWAY_SEC", "60"))
+TOKEN_DEFAULT_TTL    = int(os.getenv("TOKEN_DEFAULT_TTL_SEC",    "900"))

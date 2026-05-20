@@ -1,0 +1,135 @@
+"""
+main.py - FastAPI application entry point.
+
+Starts the server and wires together all routes:
+  POST /api/v1/upi/secure                          -> UPI encrypted secure call
+  GET  /api/v1/transactions/history                -> Transaction history enquiry
+  POST /api/v1/accounts/apply-hold                 -> Apply account hold
+  GET  /api/v1/accounts/demand-deposit             -> Demand deposit account enquiry
+  GET  /health                                     -> Health check
+
+Run:
+  uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+"""
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+import config
+from hsbc_client import HSBCHubClient
+from logger import get_logger
+from upi import AESCipher, UPIClient
+
+# Route blueprints
+from routes import accounts, transactions, upi
+
+logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lifespan – build shared clients once at startup, close cleanly on shutdown
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("=== HSBC Gateway starting ===")
+
+    # Shared httpx client (connection-pooled, used by both UPI + HSBC hub calls)
+    http = httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            connect=config.HTTP_CONNECT_TIMEOUT,
+            read=config.HTTP_READ_TIMEOUT,
+            write=config.HTTP_READ_TIMEOUT,
+            pool=config.HTTP_CONNECT_TIMEOUT,
+        ),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        transport=httpx.AsyncHTTPTransport(retries=config.HTTP_RETRIES),
+        verify=True,   # enforce TLS cert validation in production
+    )
+
+    # UPI client (AES cipher + token cache)
+    cipher          = AESCipher(config.UPI_AES_KEY_HEX)
+    app.state.upi   = UPIClient(http=http, cipher=cipher)
+
+    # HSBC Hub client (transaction history, account hold, DDA enquiry)
+    app.state.hsbc  = HSBCHubClient(http=http)
+    app.state.http  = http
+
+    logger.info("=== HSBC Gateway started and ready ===")
+    try:
+        yield
+    finally:
+        await http.aclose()
+        logger.info("=== HSBC Gateway shut down cleanly ===")
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="HSBC MHA Gateway",
+    version="1.0.0",
+    description=(
+        "Internal gateway wrapping HSBC UPI and Hub APIs.\n\n"
+        "All requests are logged with a `requestId` for end-to-end tracing."
+    ),
+    lifespan=lifespan,
+    docs_url="/docs",       # remove or gate in prod
+    redoc_url="/redoc",
+)
+
+
+# ---------------------------------------------------------------------------
+# Global error handler – never expose stack traces to clients
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(Exception)
+async def _unhandled_exception(_req: Request, exc: Exception):
+    logger.exception("Unhandled exception: %s", exc)
+    return JSONResponse(
+        {"error": "internal_error", "message": "An unexpected error occurred"},
+        status_code=500,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+
+@app.get("/health", tags=["Health"])
+async def health():
+    """Quick liveness probe."""
+    return {"status": "ok", "service": "hsbc-mha-gateway"}
+
+
+# ---------------------------------------------------------------------------
+# Register routers
+# ---------------------------------------------------------------------------
+
+app.include_router(upi.router,          prefix="/api/v1")
+app.include_router(transactions.router, prefix="/api/v1")
+app.include_router(accounts.router,     prefix="/api/v1")
+
+# To add a new feature later:
+#   1. Create routes/payments.py with an APIRouter
+#   2. Import it above and add: app.include_router(payments.router, prefix="/api/v1")
+
+
+# ---------------------------------------------------------------------------
+# Entry point (dev only – use uvicorn CLI in production)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=True,
+    )

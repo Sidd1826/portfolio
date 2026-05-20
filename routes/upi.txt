@@ -1,0 +1,54 @@
+"""
+routes/upi.py - UPI secure API route.
+"""
+from __future__ import annotations
+
+import uuid
+from typing import Any, Optional
+
+from fastapi import APIRouter, Body, Header, HTTPException, Request
+
+from logger import get_logger
+from upi import CryptoError, UPIClient, UPIError
+
+logger = get_logger(__name__)
+router = APIRouter(prefix="/upi", tags=["UPI"])
+
+
+@router.post("/secure", summary="Send encrypted payload to HSBC UPI secure endpoint")
+async def upi_secure(
+    request: Request,
+    payload: dict[str, Any] = Body(..., examples=[{"upiId": "user@bank", "amount": 100.5}]),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+):
+    """
+    Accepts plain JSON, encrypts with AES-128-ECB, calls HSBC secure endpoint,
+    decrypts the response, and returns plain JSON.
+    """
+    req_id = x_request_id or str(uuid.uuid4())
+    logger.info("[%s] POST /api/v1/upi/secure | keys=%s", req_id, list(payload.keys()))
+
+    upi: UPIClient = request.app.state.upi
+
+    try:
+        result = await upi.send_secure(payload)
+        logger.info("[%s] UPI secure success", req_id)
+        return {"requestId": req_id, "data": result}
+
+    except CryptoError as e:
+        logger.error("[%s] Crypto error: %s", req_id, e)
+        raise HTTPException(
+            status_code=502,
+            detail={"requestId": req_id, "error": "crypto_error", "message": str(e)},
+        )
+    except UPIError as e:
+        logger.error("[%s] UPI error: %s | upstream_status=%s", req_id, e, e.upstream_status)
+        raise HTTPException(
+            status_code=e.status_code,
+            detail={
+                "requestId":      req_id,
+                "error":          "upstream_error",
+                "message":        str(e),
+                "upstreamStatus": e.upstream_status,
+            },
+        )
