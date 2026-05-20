@@ -1,6 +1,8 @@
 """
 config.py - All configuration from environment variables.
-Copy .env.example to .env and fill in your values.
+Copy .env.example to .env and fill in real values.
+
+ALL HSBC headers are managed here — internal callers pass nothing.
 """
 import os
 
@@ -15,24 +17,20 @@ UPI_PASSWORD    = os.getenv("UPI_PASSWORD",    "")
 UPI_AES_KEY_HEX = os.getenv("UPI_AES_KEY_HEX","")
 
 # ---------------------------------------------------------------------------
-# HSBC Hub APIs (shared base + headers)
+# HSBC Hub API — Base URLs
 # ---------------------------------------------------------------------------
-
-# Transaction History
 TXN_HISTORY_BASE_URL = os.getenv(
     "TXN_HISTORY_BASE_URL",
     "https://cbil-in-hbap-hub-dd-trans-history-enq-3.hsbc-cbsa-hub-cert.svc.apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc",
 )
-TXN_HISTORY_PATH = os.getenv("TXN_HISTORY_PATH", "/api/")
+TXN_HISTORY_PATH = os.getenv("TXN_HISTORY_PATH", "/api/v3/account/demand-deposit-transaction-history")
 
-# Account Hold
 ACCT_HOLD_BASE_URL = os.getenv(
     "ACCT_HOLD_BASE_URL",
     "https://cbil-in-hbap-hub-add-acct-hld-pst-2.hsbc-cbsa-hub-cert.svc.aplapg02.shp.ape1.pre-prod.aws.cloud.hsbc",
 )
 ACCT_HOLD_PATH = os.getenv("ACCT_HOLD_PATH", "/api/accounts/apply-account-holds")
 
-# Demand Deposit Account Enquiry
 DDA_BASE_URL = os.getenv(
     "DDA_BASE_URL",
     "https://cbil-in-hbap-hub-demand-deposit-acct-enq-5.hsbc-cbsa-hub-cert.svc.aplapg02.shp.ape1.pre-prod.aws.cloud.hsbc",
@@ -40,32 +38,66 @@ DDA_BASE_URL = os.getenv(
 DDA_PATH = os.getenv("DDA_PATH", "/api/v5/accounts/demand-deposit-account")
 
 # ---------------------------------------------------------------------------
-# HSBC Common Header Values
+# HSBC Headers — Transaction History API
 # ---------------------------------------------------------------------------
-HSBC_CB_CLIENT_ID       = os.getenv("HSBC_CB_CLIENT_ID",       "SBI")
-HSBC_CB_CLIENT_SECRET   = os.getenv("HSBC_CB_CLIENT_SECRET",   "SBI11")
-HSBC_CB_STAFF_USER_ID   = os.getenv("HSBC_CB_STAFF_USER_ID",   "AP19")
-HSBC_CHNL_COUNTRY_CODE  = os.getenv("HSBC_CHNL_COUNTRY_CODE",  "IN")
-HSBC_CHNL_GROUP_MEMBER  = os.getenv("HSBC_CHNL_GROUP_MEMBER",  "HSBC")
-HSBC_CLIENT_ID          = os.getenv("HSBC_CLIENT_ID",          "SBI11")
-HSBC_CLIENT_SECRET      = os.getenv("HSBC_CLIENT_SECRET",      "WEB")
-HSBC_CONSUMER_ID        = os.getenv("HSBC_CONSUMER_ID",        "INHSBC_HUB_MHA")
-HSBC_E2E_TRUST_TOKEN    = os.getenv("HSBC_E2E_TRUST_TOKEN",    "")
-HSBC_GBGF               = os.getenv("HSBC_GBGF",               "WPB")
-HSBC_GLOBAL_CHANNEL_ID  = os.getenv("HSBC_GLOBAL_CHANNEL_ID",  "STAFFWEB")
-HSBC_SOURCE_SYSTEM_ID   = os.getenv("HSBC_SOURCE_SYSTEM_ID",   "237139")
-HSBC_SRC_DEVICE_ID      = os.getenv("HSBC_SRC_DEVICE_ID",      "255.255.222.222")
-HSBC_SRC_USER_AGENT     = os.getenv("HSBC_SRC_USER_AGENT",     "Mozilla")
-HSBC_TARGET_SYSTEM_ENV  = os.getenv("HSBC_TARGET_SYSTEM_ENV",  "F1SYS")
-HSBC_USER_ID            = os.getenv("HSBC_USER_ID",            "API9")
-HSBC_WORKSTATION_ID     = os.getenv("HSBC_WORKSTATION_ID",     "API9")
+TXN_STAFF_USER_ID          = os.getenv("TXN_STAFF_USER_ID",          "DMS1")
+TXN_CLIENT_ID              = os.getenv("TXN_CLIENT_ID",              "SBI")
+TXN_CLIENT_SECRET          = os.getenv("TXN_CLIENT_SECRET",          "SBI1")
+TXN_CONSUMER_ID            = os.getenv("TXN_CONSUMER_ID",            "INHSBC_HUB_DMS")
+TXN_E2E_TRUST_TOKEN        = os.getenv("TXN_E2E_TRUST_TOKEN",        "")
+TXN_GBGF                   = os.getenv("TXN_GBGF",                   "RBWM")
+TXN_GLOBAL_CHANNEL_ID      = os.getenv("TXN_GLOBAL_CHANNEL_ID",      "OHB")
+TXN_TARGET_SYSTEM_ENV      = os.getenv("TXN_TARGET_SYSTEM_ENV",      "UAT001")
+TXN_USER_ID                = os.getenv("TXN_USER_ID",                "user123")
+TXN_WORKSTATION_ID         = os.getenv("TXN_WORKSTATION_ID",         "DMS1")
+TXN_COUNTRY_CODE           = os.getenv("TXN_COUNTRY_CODE",           "IN")
+TXN_GROUP_MEMBER           = os.getenv("TXN_GROUP_MEMBER",           "HSBC")
+TXN_SRC_USER_AGENT         = os.getenv("TXN_SRC_USER_AGENT",         "Mozilla")
+
+# ---------------------------------------------------------------------------
+# HSBC Headers — Apply Account Hold API
+# ---------------------------------------------------------------------------
+HOLD_STAFF_USER_ID         = os.getenv("HOLD_STAFF_USER_ID",         "AP19")
+HOLD_CLIENT_ID             = os.getenv("HOLD_CLIENT_ID",             "SBI")
+HOLD_CLIENT_SECRET         = os.getenv("HOLD_CLIENT_SECRET",         "SBI11")
+HOLD_CONSUMER_ID           = os.getenv("HOLD_CONSUMER_ID",           "INHSBC_HUB_MHA")
+HOLD_E2E_TRUST_TOKEN       = os.getenv("HOLD_E2E_TRUST_TOKEN",       "")
+HOLD_GBGF                  = os.getenv("HOLD_GBGF",                  "WPB")
+HOLD_GLOBAL_CHANNEL_ID     = os.getenv("HOLD_GLOBAL_CHANNEL_ID",     "STAFFWEB")
+HOLD_TARGET_SYSTEM_ENV     = os.getenv("HOLD_TARGET_SYSTEM_ENV",     "F1SYS")
+HOLD_USER_ID               = os.getenv("HOLD_USER_ID",               "API9")
+HOLD_WORKSTATION_ID        = os.getenv("HOLD_WORKSTATION_ID",        "API9")
+HOLD_COUNTRY_CODE          = os.getenv("HOLD_COUNTRY_CODE",          "IN")
+HOLD_GROUP_MEMBER          = os.getenv("HOLD_GROUP_MEMBER",          "HSBC")
+HOLD_SRC_USER_AGENT        = os.getenv("HOLD_SRC_USER_AGENT",        "Mozilla")
+HOLD_SOURCE_SYSTEM_ID      = os.getenv("HOLD_SOURCE_SYSTEM_ID",      "237139")
+HOLD_SRC_DEVICE_ID         = os.getenv("HOLD_SRC_DEVICE_ID",         "255.255.222.222")
+
+# ---------------------------------------------------------------------------
+# HSBC Headers — Demand Deposit Account Enquiry API
+# ---------------------------------------------------------------------------
+DDA_STAFF_USER_ID          = os.getenv("DDA_STAFF_USER_ID",          "API9")
+DDA_CLIENT_ID              = os.getenv("DDA_CLIENT_ID",              "SBI11")
+DDA_CLIENT_SECRET          = os.getenv("DDA_CLIENT_SECRET",          "WEB")
+DDA_CONSUMER_ID            = os.getenv("DDA_CONSUMER_ID",            "INHSBC_HUB_MHA")
+DDA_E2E_TRUST_TOKEN        = os.getenv("DDA_E2E_TRUST_TOKEN",        "")
+DDA_GBGF                   = os.getenv("DDA_GBGF",                   "RBWM")
+DDA_GLOBAL_CHANNEL_ID      = os.getenv("DDA_GLOBAL_CHANNEL_ID",      "MOBILE")
+DDA_TARGET_SYSTEM_ENV      = os.getenv("DDA_TARGET_SYSTEM_ENV",      "")
+DDA_USER_ID                = os.getenv("DDA_USER_ID",                "AP19")
+DDA_WORKSTATION_ID         = os.getenv("DDA_WORKSTATION_ID",         "AP19")
+DDA_COUNTRY_CODE           = os.getenv("DDA_COUNTRY_CODE",           "IN")
+DDA_GROUP_MEMBER           = os.getenv("DDA_GROUP_MEMBER",           "HSBC")
+DDA_SRC_USER_AGENT         = os.getenv("DDA_SRC_USER_AGENT",         "Mozilla")
+DDA_SOURCE_SYSTEM_ID       = os.getenv("DDA_SOURCE_SYSTEM_ID",       "")
+DDA_CLIENT_IP              = os.getenv("DDA_CLIENT_IP",              "255.255.222.222")
 
 # ---------------------------------------------------------------------------
 # HTTP Client
 # ---------------------------------------------------------------------------
-HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT",   "5"))
-HTTP_READ_TIMEOUT    = float(os.getenv("HTTP_READ_TIMEOUT",      "30"))
-HTTP_RETRIES         = int(os.getenv("HTTP_RETRIES",             "2"))
+HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "5"))
+HTTP_READ_TIMEOUT    = float(os.getenv("HTTP_READ_TIMEOUT",    "30"))
+HTTP_RETRIES         = int(os.getenv("HTTP_RETRIES",           "2"))
 
 # ---------------------------------------------------------------------------
 # Token Cache (UPI)

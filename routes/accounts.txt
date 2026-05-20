@@ -1,12 +1,13 @@
 """
-routes/accounts.py - Account Hold and Demand Deposit Account Enquiry routes.
+routes/accounts.py - Account Hold + Demand Deposit Enquiry.
+Caller passes only business data — no HSBC headers needed.
 """
 from __future__ import annotations
 
 import uuid
-from typing import Any, Optional
+from typing import Optional
 
-from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Body, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from hsbc_client import HSBCError, HSBCHubClient
@@ -17,31 +18,31 @@ router = APIRouter(prefix="/accounts", tags=["Accounts"])
 
 
 # ---------------------------------------------------------------------------
-# Pydantic schema for Apply Account Hold
+# Schema
 # ---------------------------------------------------------------------------
 
 class ApplyHoldDetails(BaseModel):
-    customerNumber:       Optional[str] = Field(default=None)
-    globalUserId:         Optional[str] = Field(default=None)
-    accountNumber:        str           = Field(..., description="e.g. INHSBC011019072006")
-    hsbcnetCustomerId:    Optional[str] = Field(default=None)
-    accountCurrencyCode:  str           = Field(..., description="e.g. INR")
-    holdTillExpiredDate:  str           = Field(..., description="YYYY-MM-DD e.g. 2028-12-31")
-    holdType:             str           = Field(..., description="Hold type code")
-    holdCurrency:         str           = Field(..., description="e.g. INR")
-    holdAmount:           str           = Field(..., description="e.g. 28.28")
-    holdNarrative1:       Optional[str] = Field(default=None)
-    holdNarrative2:       Optional[str] = Field(default=None)
-    holdNarrative3:       Optional[str] = Field(default=None)
-    holdNarrative4:       Optional[str] = Field(default=None)
-    sequenceNumber:       Optional[str] = Field(default=None)
+    customerNumber:       Optional[str] = None
+    globalUserId:         Optional[str] = None 
+    accountNumber:        str  = Field(..., description="e.g. INHSBC011019072006")
+    hsbcnetCustomerId:    Optional[str] = None
+    accountCurrencyCode:  str  = Field(..., description="e.g. INR")
+    holdTillExpiredDate:  str  = Field(..., description="YYYY-MM-DD")
+    holdType:             str  = Field(..., description="Hold type code e.g. B")
+    holdCurrency:         str  = Field(..., description="e.g. INR")
+    holdAmount:           str  = Field(..., description="e.g. 28.28")
+    holdNarrative1:       Optional[str] = None
+    holdNarrative2:       Optional[str] = None
+    holdNarrative3:       Optional[str] = None
+    holdNarrative4:       Optional[str] = None
+    sequenceNumber:       Optional[str] = None
     holdValueDate:        Optional[str] = Field(default=None, description="YYYY-MM-DD")
     holdDepositDate:      Optional[str] = Field(default=None, description="YYYY-MM-DD")
-    clearingArea:         Optional[str] = Field(default=None)
-    clearingNumber:       Optional[str] = Field(default=None)
-    balanceCheckRequired: Optional[str] = Field(default=None)
-    onlineOfflineFlag:    Optional[str] = Field(default=None)
-    debitCardNumber:      Optional[str] = Field(default=None)
+    clearingArea:         Optional[str] = None
+    clearingNumber:       Optional[str] = None
+    balanceCheckRequired: Optional[str] = None
+    onlineOfflineFlag:    Optional[str] = None
+    debitCardNumber:      Optional[str] = None
 
 
 class ApplyHoldRequest(BaseModel):
@@ -49,109 +50,68 @@ class ApplyHoldRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Route 1: Apply Account Hold
+# Route 1 — Apply Account Hold
 # ---------------------------------------------------------------------------
 
 @router.post("/apply-hold", summary="Apply a hold on an account")
 async def apply_account_hold(
     request: Request,
     body: ApplyHoldRequest = Body(...),
-    x_request_id:    Optional[str] = Header(default=None, alias="X-Request-ID"),
-    x_session_id:    Optional[str] = Header(default=None, alias="X-Session-ID"),
-    x_staff_user_id: Optional[str] = Header(default=None, alias="X-Staff-User-Id"),
-    x_user_id:       Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     """
-    Apply a debit/credit hold on an HSBC account.
-    Maps to: POST /api/accounts/apply-account-holds
+    Apply a hold on an HSBC account.
+    Just pass the hold details — all HSBC headers are managed internally.
     """
-    req_id = x_request_id or str(uuid.uuid4())
+    req_id = str(uuid.uuid4())
     logger.info(
-        "[%s] POST /api/v1/accounts/apply-hold | account=%s amount=%s",
-        req_id,
-        body.applyHoldDetails.accountNumber,
-        body.applyHoldDetails.holdAmount,
+        "[%s] POST /accounts/apply-hold | accountNumber=%s amount=%s",
+        req_id, body.applyHoldDetails.accountNumber, body.applyHoldDetails.holdAmount,
     )
 
     hub: HSBCHubClient = request.app.state.hsbc
-
     try:
         result = await hub.apply_account_hold(
-            apply_hold_details=body.applyHoldDetails.model_dump(exclude_none=True),
-            request_correlation_id=req_id,
-            session_correlation_id=x_session_id,
-            staff_user_id=x_staff_user_id,
-            user_id=x_user_id,
+            apply_hold_details=body.applyHoldDetails.model_dump(exclude_none=True)
         )
         logger.info("[%s] Apply account hold success", req_id)
         return {"requestId": req_id, "data": result}
-
     except HSBCError as e:
-        logger.error("[%s] HSBC error: %s | upstream=%s", req_id, e, e.upstream_status)
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "requestId":      req_id,
-                "error":          "upstream_error",
-                "message":        str(e),
-                "upstreamStatus": e.upstream_status,
-            },
-        )
+        logger.error("[%s] %s | upstream=%s", req_id, e, e.upstream_status)
+        raise HTTPException(status_code=e.status_code, detail={
+            "requestId": req_id, "error": "upstream_error",
+            "message": str(e), "upstreamStatus": e.upstream_status,
+        })
 
 
 # ---------------------------------------------------------------------------
-# Route 2: Demand Deposit Account Enquiry
+# Route 2 — Demand Deposit Account Enquiry
 # ---------------------------------------------------------------------------
 
 @router.get("/demand-deposit", summary="Demand deposit account enquiry")
 async def get_demand_deposit_account(
     request: Request,
     hub_customer_number: str           = Query(..., alias="hubCustomerNumber", description="e.g. 1111"),
-    x_request_id:        Optional[str] = Header(default=None, alias="X-Request-ID"),
-    x_session_id:        Optional[str] = Header(default=None, alias="X-Session-ID"),
-    x_staff_user_id:     Optional[str] = Header(default=None, alias="X-Staff-User-Id"),
-    x_user_id:           Optional[str] = Header(default=None, alias="X-User-Id"),
-    x_gbgf:              Optional[str] = Header(default=None, alias="X-GBGF"),
-    x_global_channel_id: Optional[str] = Header(default=None, alias="X-Global-Channel-Id"),
-    x_sensitive_data:    Optional[str] = Header(default=None, alias="X-Sensitive-Data"),
+    sensitive_data:      Optional[str] = Query(default=None, alias="sensitiveData",
+                                               description='e.g. [{"key":"1111","value":"INHSBC003297637"}]'),
 ):
     """
-    Fetch demand deposit account details by hub customer number.
-    Maps to: GET /api/v5/accounts/demand-deposit-account?hubCustomerNumber=<n>
-
-    For sensitive data pass JSON array as header value, e.g.:
-    X-Sensitive-Data: [{"key":"1111","value":"INHSBC003297637"}]
+    Fetch demand deposit account details.
+    Just pass `hubCustomerNumber` — all HSBC headers are managed internally.
     """
-    req_id = x_request_id or str(uuid.uuid4())
-    logger.info(
-        "[%s] GET /api/v1/accounts/demand-deposit | hubCustomerNumber=%s",
-        req_id, hub_customer_number,
-    )
+    req_id = str(uuid.uuid4())
+    logger.info("[%s] GET /accounts/demand-deposit | hubCustomerNumber=%s", req_id, hub_customer_number)
 
     hub: HSBCHubClient = request.app.state.hsbc
-
     try:
         result = await hub.get_demand_deposit_account(
             hub_customer_number=hub_customer_number,
-            request_correlation_id=req_id,
-            session_correlation_id=x_session_id,
-            staff_user_id=x_staff_user_id,
-            user_id=x_user_id,
-            gbgf=x_gbgf,
-            global_channel_id=x_global_channel_id,
-            sensitive_data=x_sensitive_data,
+            sensitive_data=sensitive_data,
         )
         logger.info("[%s] Demand deposit account enquiry success", req_id)
         return {"requestId": req_id, "data": result}
-
     except HSBCError as e:
-        logger.error("[%s] HSBC error: %s | upstream=%s", req_id, e, e.upstream_status)
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "requestId":      req_id,
-                "error":          "upstream_error",
-                "message":        str(e),
-                "upstreamStatus": e.upstream_status,
-            },
-        )
+        logger.error("[%s] %s | upstream=%s", req_id, e, e.upstream_status)
+        raise HTTPException(status_code=e.status_code, detail={
+            "requestId": req_id, "error": "upstream_error",
+            "message": str(e), "upstreamStatus": e.upstream_status,
+        })

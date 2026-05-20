@@ -1,4 +1,6 @@
-
+"""
+upi.py - AES-128-ECB cipher and HSBC UPI secure API client.
+"""
 from __future__ import annotations
 
 import asyncio
