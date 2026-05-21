@@ -17,8 +17,6 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-import ssl
-
 import httpx
 from fastapi import FastAPI, Body, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -49,27 +47,22 @@ async def lifespan(app: FastAPI):
     log.info("TLS VERIFY   : False")
     log.info("READ TIMEOUT : %.0f seconds", config.HTTP_READ_TIMEOUT)
 
-    # Build an SSL context that fully disables certificate verification.
-    # verify=False alone is sometimes not enough when a proxy is involved
-    # because the proxy itself does a TLS handshake before forwarding —
-    # an explicit SSLContext ensures both hops skip verification.
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode    = ssl.CERT_NONE
-
-    http = httpx.AsyncClient(
-        mounts={
-            "https://": httpx.AsyncHTTPTransport(proxy=proxy, verify=ssl_ctx),
-            "http://":  httpx.AsyncHTTPTransport(proxy=proxy, verify=ssl_ctx),
-        },
-        timeout=httpx.Timeout(
+    # Pass proxy + verify=False directly on AsyncClient — simplest and most reliable.
+    # Do NOT use mounts= alongside this; mounts can silently override verify.
+    client_kwargs = {
+        "verify":  False,
+        "timeout": httpx.Timeout(
             connect=config.HTTP_CONNECT_TIMEOUT,
             read=config.HTTP_READ_TIMEOUT,
             write=config.HTTP_READ_TIMEOUT,
             pool=config.HTTP_CONNECT_TIMEOUT,
         ),
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-    )
+        "limits":  httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    }
+    if proxy:
+        client_kwargs["proxy"] = proxy
+
+    http = httpx.AsyncClient(**client_kwargs)
 
     cipher         = AESCipher(config.UPI_AES_KEY_HEX)
     app.state.upi  = UPIClient(http=http, cipher=cipher)
