@@ -12,6 +12,7 @@ Routes:
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -31,25 +32,22 @@ log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Lifespan — build shared httpx client with proxy + verify=False
+# Lifespan
+#   UPI : async httpx client (proxy + verify=False via mounts)
+#   HSBC: sync requests session (proxy + verify=False on session)
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting HSBC MHA Gateway")
+    log.info("=== Starting HSBC MHA Gateway ===")
 
-    proxy = config.PROXY_URL or None  # trailing slash already stripped by config.py
+    proxy = config.PROXY_URL or None
+    log.info("PROXY     : %s", proxy or "DISABLED")
+    log.info("VERIFY    : False (for HSBC internal hosts)")
+    log.info("TIMEOUT   : connect=%.0fs read=%.0fs", config.HTTP_CONNECT_TIMEOUT, config.HTTP_READ_TIMEOUT)
 
-    if proxy:
-        log.info("PROXY MODE   : ENABLED -> %s", proxy)
-    else:
-        log.info("PROXY MODE   : DISABLED (set PROXY_URL in .env to enable)")
-    log.info("TLS VERIFY   : False")
-    log.info("READ TIMEOUT : %.0f seconds", config.HTTP_READ_TIMEOUT)
-
-    # Pass proxy + verify=False directly on AsyncClient — simplest and most reliable.
-    # Do NOT use mounts= alongside this; mounts can silently override verify.
-    client_kwargs = {
+    # ---- httpx async client (only used by UPI) ----
+    httpx_kwargs: dict[str, Any] = {
         "verify":  False,
         "timeout": httpx.Timeout(
             connect=config.HTTP_CONNECT_TIMEOUT,
@@ -60,19 +58,22 @@ async def lifespan(app: FastAPI):
         "limits":  httpx.Limits(max_connections=100, max_keepalive_connections=20),
     }
     if proxy:
-        client_kwargs["proxy"] = proxy
+        httpx_kwargs["proxy"] = proxy
+    http = httpx.AsyncClient(**httpx_kwargs)
 
-    http = httpx.AsyncClient(**client_kwargs)
+    # ---- requests-based HSBC client ----
+    hsbc = HSBCHubClient()
 
-    cipher         = AESCipher(config.UPI_AES_KEY_HEX)
+    cipher = AESCipher(config.UPI_AES_KEY_HEX)
     app.state.upi  = UPIClient(http=http, cipher=cipher)
-    app.state.hsbc = HSBCHubClient(http=http)
+    app.state.hsbc = hsbc
     app.state.http = http
 
-    log.info("Gateway ready")
+    log.info("=== Gateway ready ===")
     yield
     await http.aclose()
-    log.info("Gateway shut down")
+    hsbc.close()
+    log.info("=== Gateway shut down ===")
 
 
 # ---------------------------------------------------------------------------
@@ -98,56 +99,7 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Debug — test proxy + connectivity (remove in production)
-# ---------------------------------------------------------------------------
-
-@app.get("/debug/proxy", tags=["Debug"])
-async def debug_proxy(request: Request):
-    """
-    Hit this endpoint to check:
-    1. What proxy is configured
-    2. Whether the proxy can actually reach HSBC
-    Call: GET /debug/proxy
-    """
-    import config as cfg
-    http: httpx.AsyncClient = request.app.state.http
-
-    result = {
-        "proxy_url":    cfg.PROXY_URL or "NOT SET",
-        "verify":       False,
-        "read_timeout": cfg.HTTP_READ_TIMEOUT,
-        "connectivity": {}
-    }
-
-    # Test each HSBC host with a short timeout so it fails fast
-    test_urls = {
-        "txn_history": cfg.TXN_HISTORY_URL,
-        "acct_hold":   cfg.ACCT_HOLD_URL,
-        "dda":         cfg.DDA_URL,
-    }
-
-    for name, url in test_urls.items():
-        try:
-            # HEAD request — just check if host is reachable, don't wait for full response
-            resp = await http.head(url, timeout=10)
-            result["connectivity"][name] = {"status": "reachable", "http_code": resp.status_code}
-        except httpx.ProxyError as e:
-            result["connectivity"][name] = {"status": "proxy_error", "detail": str(e)}
-        except httpx.ConnectError as e:
-            result["connectivity"][name] = {"status": "connect_error", "detail": str(e)}
-        except httpx.ConnectTimeout:
-            result["connectivity"][name] = {"status": "connect_timeout", "detail": "Could not reach host within 10s"}
-        except httpx.ReadTimeout:
-            # Got through proxy but server didn't respond — proxy is working
-            result["connectivity"][name] = {"status": "proxy_ok_server_slow", "detail": "Proxy connected but server timed out — proxy is working"}
-        except Exception as e:
-            result["connectivity"][name] = {"status": "error", "detail": str(e)}
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# UPI Secure
+# UPI Secure  (async via httpx)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/upi/secure", tags=["UPI"])
@@ -155,7 +107,6 @@ async def upi_secure(
     request: Request,
     payload: dict[str, Any] = Body(..., examples=[{"upiId": "user@bank", "amount": 100.5}]),
 ):
-    """Encrypt payload -> call HSBC UPI -> decrypt response."""
     req_id = str(uuid.uuid4())
     log.info("[%s] POST /upi/secure", req_id)
     upi: UPIClient = request.app.state.upi
@@ -172,7 +123,7 @@ async def upi_secure(
 
 
 # ---------------------------------------------------------------------------
-# Transaction History
+# Transaction History  (sync via requests, run in threadpool)
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/transactions/history", tags=["Transactions"])
@@ -182,12 +133,14 @@ async def get_transaction_history(
     from_date:      Optional[str] = Query(default=None, alias="fromDate",  description="YYYY-MM-DD"),
     to_date:        Optional[str] = Query(default=None, alias="toDate",    description="YYYY-MM-DD"),
 ):
-    """Fetch transaction history. Just pass accountNumber."""
     req_id = str(uuid.uuid4())
     log.info("[%s] GET /transactions/history | accountNumber=%s", req_id, account_number)
     hub: HSBCHubClient = request.app.state.hsbc
     try:
-        result = await hub.get_transaction_history(account_number, from_date=from_date, to_date=to_date)
+        # asyncio.to_thread keeps event loop free while sync requests call runs
+        result = await asyncio.to_thread(
+            hub.get_transaction_history, account_number, from_date, to_date
+        )
         return {"requestId": req_id, "data": result}
     except HSBCError as e:
         log.error("[%s] %s", req_id, e)
@@ -196,7 +149,7 @@ async def get_transaction_history(
 
 
 # ---------------------------------------------------------------------------
-# Apply Account Hold
+# Apply Account Hold  (sync via requests)
 # ---------------------------------------------------------------------------
 
 class ApplyHoldDetails(BaseModel):
@@ -228,13 +181,14 @@ class ApplyHoldRequest(BaseModel):
 
 @app.post("/api/v1/accounts/apply-hold", tags=["Accounts"])
 async def apply_account_hold(request: Request, body: ApplyHoldRequest = Body(...)):
-    """Apply a hold on an HSBC account."""
     req_id = str(uuid.uuid4())
     log.info("[%s] POST /accounts/apply-hold | accountNumber=%s amount=%s",
              req_id, body.applyHoldDetails.accountNumber, body.applyHoldDetails.holdAmount)
     hub: HSBCHubClient = request.app.state.hsbc
     try:
-        result = await hub.apply_account_hold(body.applyHoldDetails.model_dump(exclude_none=True))
+        result = await asyncio.to_thread(
+            hub.apply_account_hold, body.applyHoldDetails.model_dump(exclude_none=True)
+        )
         return {"requestId": req_id, "data": result}
     except HSBCError as e:
         log.error("[%s] %s", req_id, e)
@@ -243,7 +197,7 @@ async def apply_account_hold(request: Request, body: ApplyHoldRequest = Body(...
 
 
 # ---------------------------------------------------------------------------
-# Demand Deposit Account Enquiry
+# Demand Deposit Account Enquiry  (sync via requests)
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/accounts/demand-deposit", tags=["Accounts"])
@@ -253,12 +207,13 @@ async def get_demand_deposit_account(
     sensitive_data:      Optional[str] = Query(default=None, alias="sensitiveData",
                                                description='e.g. [{"key":"1111","value":"INHSBC003297637"}]'),
 ):
-    """Fetch demand deposit account details."""
     req_id = str(uuid.uuid4())
     log.info("[%s] GET /accounts/demand-deposit | hubCustomerNumber=%s", req_id, hub_customer_number)
     hub: HSBCHubClient = request.app.state.hsbc
     try:
-        result = await hub.get_demand_deposit_account(hub_customer_number, sensitive_data=sensitive_data)
+        result = await asyncio.to_thread(
+            hub.get_demand_deposit_account, hub_customer_number, sensitive_data
+        )
         return {"requestId": req_id, "data": result}
     except HSBCError as e:
         log.error("[%s] %s", req_id, e)
