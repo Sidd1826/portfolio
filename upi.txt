@@ -1,5 +1,5 @@
 """
-upi.py - AES-128-ECB cipher and HSBC UPI client.
+upi.py - AES-128-ECB cipher + HSBC UPI client (async, httpx).
 """
 from __future__ import annotations
 
@@ -21,12 +21,9 @@ from logger import get_logger
 log = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
 class CryptoError(Exception):
     pass
+
 
 class UPIError(Exception):
     def __init__(self, msg: str, status_code: int = 502, upstream_status: Optional[int] = None):
@@ -36,7 +33,7 @@ class UPIError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# AES-128-ECB  (Java: AES/ECB/PKCS5Padding compatible)
+# AES-128 / ECB / PKCS7  (Java AES/ECB/PKCS5Padding compatible)
 # ---------------------------------------------------------------------------
 
 class AESCipher:
