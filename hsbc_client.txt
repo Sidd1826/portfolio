@@ -1,18 +1,40 @@
 """
-hsbc_client.py - HSBC Hub API client.
+hsbc_client.py - HSBC Hub API client using `requests` (sync).
 
-Headers are defined directly in each function (no env vars for headers).
-Every request uses the configured proxy and verify=False.
+Why `requests` instead of `httpx`?
+  Corporate proxies + self-signed certs work reliably with `requests` and
+  `verify=False`. httpx's proxy+SSL combination is more fragile in some
+  versions and was causing CERTIFICATE_VERIFY_FAILED errors.
+
+FastAPI handles these sync calls by running them in a threadpool —
+no extra setup needed; just `def` (not `async def`) endpoints would
+also work, but we wrap each call in `asyncio.to_thread(...)` from the
+routes to keep the event loop free.
+
+Every request:
+  - uses the configured proxy (config.PROXY_URL)
+  - sets verify=False
+  - has a 60s timeout
+
+Headers are defined directly inside each function — no env vars,
+no caller headers, no confusion.
 """
 from __future__ import annotations
 
 import uuid
+import warnings
 from typing import Any, Optional
 
-import httpx
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.exceptions import InsecureRequestWarning
+from urllib3.util.retry import Retry
 
 import config
 from logger import get_logger
+
+# Silence "InsecureRequestWarning" since we intentionally use verify=False
+warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 log = get_logger(__name__)
 
@@ -25,20 +47,46 @@ class HSBCError(Exception):
 
 
 class HSBCHubClient:
+    """Sync HSBC Hub client. Built once and reused across requests (connection pooling)."""
 
-    def __init__(self, http: httpx.AsyncClient) -> None:
-        self._http = http
+    def __init__(self) -> None:
+        # Pooled session with auto-retry on transient failures
+        self._session = requests.Session()
+
+        retry = Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=50, max_retries=retry)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://",  adapter)
+
+        # Proxy applied to every call from this session
+        if config.PROXY_URL:
+            self._session.proxies = {"http": config.PROXY_URL, "https": config.PROXY_URL}
+            log.info("HSBCHubClient: PROXY set to %s", config.PROXY_URL)
+        else:
+            log.info("HSBCHubClient: NO proxy configured")
+
+        # verify=False applied via session.verify
+        self._session.verify = False
+        self._timeout = (config.HTTP_CONNECT_TIMEOUT, config.HTTP_READ_TIMEOUT)
+        log.info("HSBCHubClient: verify=False, timeout=%s", self._timeout)
+
+    def close(self) -> None:
+        self._session.close()
 
     # ------------------------------------------------------------------ #
     # 1. Transaction History Enquiry
-    #    GET /api/v3/account/demand-deposit-transaction-history
     # ------------------------------------------------------------------ #
-
-    async def get_transaction_history(
+    def get_transaction_history(
         self,
         account_number: str,
-        from_date:      Optional[str] = None,   # YYYY-MM-DD
-        to_date:        Optional[str] = None,   # YYYY-MM-DD
+        from_date:      Optional[str] = None,
+        to_date:        Optional[str] = None,
     ) -> dict[str, Any]:
 
         headers = {
@@ -67,14 +115,12 @@ class HSBCHubClient:
             params["toDate"] = to_date
 
         log.info("GET transaction history | accountNumber=%s", account_number)
-        return await self._get(config.TXN_HISTORY_URL, headers=headers, params=params, label="Transaction history")
+        return self._get(config.TXN_HISTORY_URL, headers=headers, params=params, label="Transaction history")
 
     # ------------------------------------------------------------------ #
     # 2. Apply Account Hold
-    #    POST /api/accounts/apply-account-holds
     # ------------------------------------------------------------------ #
-
-    async def apply_account_hold(self, apply_hold_details: dict[str, Any]) -> dict[str, Any]:
+    def apply_account_hold(self, apply_hold_details: dict[str, Any]) -> dict[str, Any]:
 
         headers = {
             "Content-Type":                        "application/json",
@@ -99,7 +145,7 @@ class HSBCHubClient:
         }
 
         log.info("POST apply account hold | accountNumber=%s", apply_hold_details.get("accountNumber"))
-        return await self._post(
+        return self._post(
             config.ACCT_HOLD_URL,
             headers=headers,
             body={"applyHoldDetails": apply_hold_details},
@@ -108,13 +154,11 @@ class HSBCHubClient:
 
     # ------------------------------------------------------------------ #
     # 3. Demand Deposit Account Enquiry
-    #    GET /api/v5/accounts/demand-deposit-account
     # ------------------------------------------------------------------ #
-
-    async def get_demand_deposit_account(
+    def get_demand_deposit_account(
         self,
         hub_customer_number: str,
-        sensitive_data:      Optional[str] = None,  # e.g. '[{"key":"1111","value":"INHSBC003297637"}]'
+        sensitive_data:      Optional[str] = None,
     ) -> dict[str, Any]:
 
         headers = {
@@ -142,7 +186,7 @@ class HSBCHubClient:
             headers["X-HSBC-Sensitive-Data"] = sensitive_data
 
         log.info("GET demand deposit account | hubCustomerNumber=%s", hub_customer_number)
-        return await self._get(
+        return self._get(
             config.DDA_URL,
             headers=headers,
             params={"hubCustomerNumber": hub_customer_number},
@@ -150,41 +194,28 @@ class HSBCHubClient:
         )
 
     # ------------------------------------------------------------------ #
-    # Internal helpers — proxy + verify=False on every request
+    # Internal helpers
     # ------------------------------------------------------------------ #
-
-    async def _get(
-        self,
-        url: str,
-        headers: dict[str, str],
-        params:  dict[str, str],
-        label:   str,
-    ) -> dict[str, Any]:
+    def _get(self, url: str, headers: dict[str, str], params: dict[str, str], label: str) -> dict[str, Any]:
         try:
-            resp = await self._http.get(url, headers=headers, params=params)
-        except httpx.HTTPError as e:
+            resp = self._session.get(url, headers=headers, params=params, timeout=self._timeout)
+        except requests.RequestException as e:
             log.exception("%s network error", label)
-            raise HSBCError(f"{label} network error: {type(e).__name__}") from e
+            raise HSBCError(f"{label} network error: {type(e).__name__}: {e}") from e
         log.info("%s response: HTTP %d", label, resp.status_code)
         return self._parse(resp, label)
 
-    async def _post(
-        self,
-        url:     str,
-        headers: dict[str, str],
-        body:    dict[str, Any],
-        label:   str,
-    ) -> dict[str, Any]:
+    def _post(self, url: str, headers: dict[str, str], body: dict[str, Any], label: str) -> dict[str, Any]:
         try:
-            resp = await self._http.post(url, headers=headers, json=body)
-        except httpx.HTTPError as e:
+            resp = self._session.post(url, headers=headers, json=body, timeout=self._timeout)
+        except requests.RequestException as e:
             log.exception("%s network error", label)
-            raise HSBCError(f"{label} network error: {type(e).__name__}") from e
+            raise HSBCError(f"{label} network error: {type(e).__name__}: {e}") from e
         log.info("%s response: HTTP %d", label, resp.status_code)
         return self._parse(resp, label)
 
     @staticmethod
-    def _parse(resp: httpx.Response, label: str) -> dict[str, Any]:
+    def _parse(resp: requests.Response, label: str) -> dict[str, Any]:
         if resp.status_code not in (200, 201):
             log.error("%s failed HTTP %d | body=%s", label, resp.status_code, resp.text[:400])
             raise HSBCError(f"{label} returned HTTP {resp.status_code}", upstream_status=resp.status_code)
