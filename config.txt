@@ -1,6 +1,6 @@
 """
-config.py - Only URLs, credentials, proxy.
-HSBC headers are defined directly in each client function.
+config.py - URLs, credentials, proxy.
+HSBC headers are defined directly in each client function (not via env).
 """
 import os
 
@@ -29,12 +29,14 @@ DDA_URL = os.getenv(
     "/api/v5/accounts/demand-deposit-account",
 )
 
-# ---- Proxy (applied to every outbound request) ----
-PROXY_URL = os.getenv("PROXY_URL", "")   # e.g. http://proxy.internal:8080
+# ---- Proxy ----
+# Trailing slash stripped automatically so http://proxy.test/ also works.
+_raw_proxy = os.getenv("PROXY_URL", "")
+PROXY_URL  = _raw_proxy.rstrip("/") if _raw_proxy else ""
 
 # ---- HTTP timeouts ----
-HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "5"))
-HTTP_READ_TIMEOUT    = float(os.getenv("HTTP_READ_TIMEOUT",    "30"))
+HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
+HTTP_READ_TIMEOUT    = float(os.getenv("HTTP_READ_TIMEOUT",    "60"))
 
 # ---- UPI token cache ----
 TOKEN_REFRESH_LEEWAY = int(os.getenv("TOKEN_REFRESH_LEEWAY_SEC", "60"))
