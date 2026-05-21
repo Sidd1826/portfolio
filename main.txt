@@ -17,6 +17,8 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
+import ssl
+
 import httpx
 from fastapi import FastAPI, Body, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -31,23 +33,41 @@ log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Lifespan — build one shared httpx client (proxy + verify=False)
+# Lifespan — build shared httpx client with proxy + verify=False
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Starting HSBC MHA Gateway")
 
-    proxy   = config.PROXY_URL or None
-    mounts  = {"https://": httpx.AsyncHTTPTransport(proxy=proxy, verify=False),
-                "http://":  httpx.AsyncHTTPTransport(proxy=proxy, verify=False)} if proxy else \
-              {"https://": httpx.AsyncHTTPTransport(verify=False),
-               "http://":  httpx.AsyncHTTPTransport(verify=False)}
+    proxy = config.PROXY_URL or None  # trailing slash already stripped by config.py
+
+    if proxy:
+        log.info("PROXY MODE   : ENABLED -> %s", proxy)
+    else:
+        log.info("PROXY MODE   : DISABLED (set PROXY_URL in .env to enable)")
+    log.info("TLS VERIFY   : False")
+    log.info("READ TIMEOUT : %.0f seconds", config.HTTP_READ_TIMEOUT)
+
+    # Build an SSL context that fully disables certificate verification.
+    # verify=False alone is sometimes not enough when a proxy is involved
+    # because the proxy itself does a TLS handshake before forwarding —
+    # an explicit SSLContext ensures both hops skip verification.
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode    = ssl.CERT_NONE
 
     http = httpx.AsyncClient(
-        mounts=mounts,
-        timeout=httpx.Timeout(connect=config.HTTP_CONNECT_TIMEOUT, read=config.HTTP_READ_TIMEOUT,
-                               write=config.HTTP_READ_TIMEOUT, pool=config.HTTP_CONNECT_TIMEOUT),
+        mounts={
+            "https://": httpx.AsyncHTTPTransport(proxy=proxy, verify=ssl_ctx),
+            "http://":  httpx.AsyncHTTPTransport(proxy=proxy, verify=ssl_ctx),
+        },
+        timeout=httpx.Timeout(
+            connect=config.HTTP_CONNECT_TIMEOUT,
+            read=config.HTTP_READ_TIMEOUT,
+            write=config.HTTP_READ_TIMEOUT,
+            pool=config.HTTP_CONNECT_TIMEOUT,
+        ),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
     )
 
@@ -56,7 +76,7 @@ async def lifespan(app: FastAPI):
     app.state.hsbc = HSBCHubClient(http=http)
     app.state.http = http
 
-    log.info("Gateway ready | proxy=%s | verify=False", proxy or "none")
+    log.info("Gateway ready")
     yield
     await http.aclose()
     log.info("Gateway shut down")
@@ -85,6 +105,55 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
+# Debug — test proxy + connectivity (remove in production)
+# ---------------------------------------------------------------------------
+
+@app.get("/debug/proxy", tags=["Debug"])
+async def debug_proxy(request: Request):
+    """
+    Hit this endpoint to check:
+    1. What proxy is configured
+    2. Whether the proxy can actually reach HSBC
+    Call: GET /debug/proxy
+    """
+    import config as cfg
+    http: httpx.AsyncClient = request.app.state.http
+
+    result = {
+        "proxy_url":    cfg.PROXY_URL or "NOT SET",
+        "verify":       False,
+        "read_timeout": cfg.HTTP_READ_TIMEOUT,
+        "connectivity": {}
+    }
+
+    # Test each HSBC host with a short timeout so it fails fast
+    test_urls = {
+        "txn_history": cfg.TXN_HISTORY_URL,
+        "acct_hold":   cfg.ACCT_HOLD_URL,
+        "dda":         cfg.DDA_URL,
+    }
+
+    for name, url in test_urls.items():
+        try:
+            # HEAD request — just check if host is reachable, don't wait for full response
+            resp = await http.head(url, timeout=10)
+            result["connectivity"][name] = {"status": "reachable", "http_code": resp.status_code}
+        except httpx.ProxyError as e:
+            result["connectivity"][name] = {"status": "proxy_error", "detail": str(e)}
+        except httpx.ConnectError as e:
+            result["connectivity"][name] = {"status": "connect_error", "detail": str(e)}
+        except httpx.ConnectTimeout:
+            result["connectivity"][name] = {"status": "connect_timeout", "detail": "Could not reach host within 10s"}
+        except httpx.ReadTimeout:
+            # Got through proxy but server didn't respond — proxy is working
+            result["connectivity"][name] = {"status": "proxy_ok_server_slow", "detail": "Proxy connected but server timed out — proxy is working"}
+        except Exception as e:
+            result["connectivity"][name] = {"status": "error", "detail": str(e)}
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # UPI Secure
 # ---------------------------------------------------------------------------
 
@@ -93,7 +162,7 @@ async def upi_secure(
     request: Request,
     payload: dict[str, Any] = Body(..., examples=[{"upiId": "user@bank", "amount": 100.5}]),
 ):
-    """Encrypt payload -> call HSBC UPI -> decrypt response. No headers needed."""
+    """Encrypt payload -> call HSBC UPI -> decrypt response."""
     req_id = str(uuid.uuid4())
     log.info("[%s] POST /upi/secure", req_id)
     upi: UPIClient = request.app.state.upi
@@ -138,27 +207,27 @@ async def get_transaction_history(
 # ---------------------------------------------------------------------------
 
 class ApplyHoldDetails(BaseModel):
-    accountNumber:        str            = Field(..., description="e.g. INHSBC011019072006")
-    accountCurrencyCode:  str            = Field(..., description="e.g. INR")
-    holdTillExpiredDate:  str            = Field(..., description="YYYY-MM-DD")
-    holdType:             str            = Field(..., description="e.g. B")
-    holdCurrency:         str            = Field(..., description="e.g. INR")
-    holdAmount:           str            = Field(..., description="e.g. 28.28")
-    customerNumber:       Optional[str]  = None
-    globalUserId:         Optional[str]  = None
-    hsbcnetCustomerId:    Optional[str]  = None
-    holdNarrative1:       Optional[str]  = None
-    holdNarrative2:       Optional[str]  = None
-    holdNarrative3:       Optional[str]  = None
-    holdNarrative4:       Optional[str]  = None
-    sequenceNumber:       Optional[str]  = None
-    holdValueDate:        Optional[str]  = None
-    holdDepositDate:      Optional[str]  = None
-    clearingArea:         Optional[str]  = None
-    clearingNumber:       Optional[str]  = None
-    balanceCheckRequired: Optional[str]  = None
-    onlineOfflineFlag:    Optional[str]  = None
-    debitCardNumber:      Optional[str]  = None
+    accountNumber:        str           = Field(..., description="e.g. INHSBC011019072006")
+    accountCurrencyCode:  str           = Field(..., description="e.g. INR")
+    holdTillExpiredDate:  str           = Field(..., description="YYYY-MM-DD")
+    holdType:             str           = Field(..., description="e.g. B")
+    holdCurrency:         str           = Field(..., description="e.g. INR")
+    holdAmount:           str           = Field(..., description="e.g. 28.28")
+    customerNumber:       Optional[str] = None
+    globalUserId:         Optional[str] = None
+    hsbcnetCustomerId:    Optional[str] = None
+    holdNarrative1:       Optional[str] = None
+    holdNarrative2:       Optional[str] = None
+    holdNarrative3:       Optional[str] = None
+    holdNarrative4:       Optional[str] = None
+    sequenceNumber:       Optional[str] = None
+    holdValueDate:        Optional[str] = None
+    holdDepositDate:      Optional[str] = None
+    clearingArea:         Optional[str] = None
+    clearingNumber:       Optional[str] = None
+    balanceCheckRequired: Optional[str] = None
+    onlineOfflineFlag:    Optional[str] = None
+    debitCardNumber:      Optional[str] = None
 
 class ApplyHoldRequest(BaseModel):
     applyHoldDetails: ApplyHoldDetails
@@ -166,7 +235,7 @@ class ApplyHoldRequest(BaseModel):
 
 @app.post("/api/v1/accounts/apply-hold", tags=["Accounts"])
 async def apply_account_hold(request: Request, body: ApplyHoldRequest = Body(...)):
-    """Apply a hold on an HSBC account. Just pass the hold details."""
+    """Apply a hold on an HSBC account."""
     req_id = str(uuid.uuid4())
     log.info("[%s] POST /accounts/apply-hold | accountNumber=%s amount=%s",
              req_id, body.applyHoldDetails.accountNumber, body.applyHoldDetails.holdAmount)
@@ -191,7 +260,7 @@ async def get_demand_deposit_account(
     sensitive_data:      Optional[str] = Query(default=None, alias="sensitiveData",
                                                description='e.g. [{"key":"1111","value":"INHSBC003297637"}]'),
 ):
-    """Fetch demand deposit account details. Just pass hubCustomerNumber."""
+    """Fetch demand deposit account details."""
     req_id = str(uuid.uuid4())
     log.info("[%s] GET /accounts/demand-deposit | hubCustomerNumber=%s", req_id, hub_customer_number)
     hub: HSBCHubClient = request.app.state.hsbc
