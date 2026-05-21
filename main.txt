@@ -1,135 +1,213 @@
 """
-main.py - FastAPI application entry point.
+main.py - FastAPI app, lifespan, all routes.
 
-Starts the server and wires together all routes:
-  POST /api/v1/upi/secure                          -> UPI encrypted secure call
-  GET  /api/v1/transactions/history                -> Transaction history enquiry
-  POST /api/v1/accounts/apply-hold                 -> Apply account hold
-  GET  /api/v1/accounts/demand-deposit             -> Demand deposit account enquiry
-  GET  /health                                     -> Health check
+Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
-Run:
-  uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+Routes:
+  GET  /health
+  POST /api/v1/upi/secure
+  GET  /api/v1/transactions/history?accountNumber=<n>
+  POST /api/v1/accounts/apply-hold
+  GET  /api/v1/accounts/demand-deposit?hubCustomerNumber=<n>
 """
 from __future__ import annotations
 
 import os
+import uuid
 from contextlib import asynccontextmanager
+from typing import Any, Optional
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Body, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 import config
-from hsbc_client import HSBCHubClient
+from hsbc_client import HSBCError, HSBCHubClient
 from logger import get_logger
-from upi import AESCipher, UPIClient
+from upi import AESCipher, CryptoError, UPIClient, UPIError
 
-# Route blueprints
-from routes import accounts, transactions, upi
-
-logger = get_logger(__name__)
+log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Lifespan – build shared clients once at startup, close cleanly on shutdown
+# Lifespan — build one shared httpx client (proxy + verify=False)
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("=== HSBC Gateway starting ===")
+    log.info("Starting HSBC MHA Gateway")
 
-    # Shared httpx client (connection-pooled, used by both UPI + HSBC hub calls)
+    proxy   = config.PROXY_URL or None
+    mounts  = {"https://": httpx.AsyncHTTPTransport(proxy=proxy, verify=False),
+                "http://":  httpx.AsyncHTTPTransport(proxy=proxy, verify=False)} if proxy else \
+              {"https://": httpx.AsyncHTTPTransport(verify=False),
+               "http://":  httpx.AsyncHTTPTransport(verify=False)}
+
     http = httpx.AsyncClient(
-        timeout=httpx.Timeout(
-            connect=config.HTTP_CONNECT_TIMEOUT,
-            read=config.HTTP_READ_TIMEOUT,
-            write=config.HTTP_READ_TIMEOUT,
-            pool=config.HTTP_CONNECT_TIMEOUT,
-        ),
+        mounts=mounts,
+        timeout=httpx.Timeout(connect=config.HTTP_CONNECT_TIMEOUT, read=config.HTTP_READ_TIMEOUT,
+                               write=config.HTTP_READ_TIMEOUT, pool=config.HTTP_CONNECT_TIMEOUT),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-        transport=httpx.AsyncHTTPTransport(retries=config.HTTP_RETRIES),
-        verify=True,   # enforce TLS cert validation in production
     )
 
-    # UPI client (AES cipher + token cache)
-    cipher          = AESCipher(config.UPI_AES_KEY_HEX)
-    app.state.upi   = UPIClient(http=http, cipher=cipher)
+    cipher         = AESCipher(config.UPI_AES_KEY_HEX)
+    app.state.upi  = UPIClient(http=http, cipher=cipher)
+    app.state.hsbc = HSBCHubClient(http=http)
+    app.state.http = http
 
-    # HSBC Hub client (transaction history, account hold, DDA enquiry)
-    app.state.hsbc  = HSBCHubClient(http=http)
-    app.state.http  = http
-
-    logger.info("=== HSBC Gateway started and ready ===")
-    try:
-        yield
-    finally:
-        await http.aclose()
-        logger.info("=== HSBC Gateway shut down cleanly ===")
+    log.info("Gateway ready | proxy=%s | verify=False", proxy or "none")
+    yield
+    await http.aclose()
+    log.info("Gateway shut down")
 
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(
-    title="HSBC MHA Gateway",
-    version="1.0.0",
-    description=(
-        "Internal gateway wrapping HSBC UPI and Hub APIs.\n\n"
-        "All requests are logged with a `requestId` for end-to-end tracing."
-    ),
-    lifespan=lifespan,
-    docs_url="/docs",       # remove or gate in prod
-    redoc_url="/redoc",
-)
+app = FastAPI(title="HSBC MHA Gateway", version="1.0.0", lifespan=lifespan, docs_url="/docs")
 
-
-# ---------------------------------------------------------------------------
-# Global error handler – never expose stack traces to clients
-# ---------------------------------------------------------------------------
 
 @app.exception_handler(Exception)
-async def _unhandled_exception(_req: Request, exc: Exception):
-    logger.exception("Unhandled exception: %s", exc)
-    return JSONResponse(
-        {"error": "internal_error", "message": "An unexpected error occurred"},
-        status_code=500,
-    )
+async def _unhandled(_req: Request, exc: Exception):
+    log.exception("Unhandled: %s", exc)
+    return JSONResponse({"error": "internal_error", "message": "An unexpected error occurred"}, status_code=500)
 
 
 # ---------------------------------------------------------------------------
-# Health check
+# Health
 # ---------------------------------------------------------------------------
 
 @app.get("/health", tags=["Health"])
 async def health():
-    """Quick liveness probe."""
     return {"status": "ok", "service": "hsbc-mha-gateway"}
 
 
 # ---------------------------------------------------------------------------
-# Register routers
+# UPI Secure
 # ---------------------------------------------------------------------------
 
-app.include_router(upi.router,          prefix="/api/v1")
-app.include_router(transactions.router, prefix="/api/v1")
-app.include_router(accounts.router,     prefix="/api/v1")
-
-# To add a new feature later:
-#   1. Create routes/payments.py with an APIRouter
-#   2. Import it above and add: app.include_router(payments.router, prefix="/api/v1")
+@app.post("/api/v1/upi/secure", tags=["UPI"])
+async def upi_secure(
+    request: Request,
+    payload: dict[str, Any] = Body(..., examples=[{"upiId": "user@bank", "amount": 100.5}]),
+):
+    """Encrypt payload -> call HSBC UPI -> decrypt response. No headers needed."""
+    req_id = str(uuid.uuid4())
+    log.info("[%s] POST /upi/secure", req_id)
+    upi: UPIClient = request.app.state.upi
+    try:
+        result = await upi.send_secure(payload)
+        return {"requestId": req_id, "data": result}
+    except CryptoError as e:
+        log.error("[%s] crypto: %s", req_id, e)
+        raise HTTPException(502, detail={"requestId": req_id, "error": "crypto_error", "message": str(e)})
+    except UPIError as e:
+        log.error("[%s] upi: %s", req_id, e)
+        raise HTTPException(e.status_code, detail={"requestId": req_id, "error": "upstream_error",
+                                                    "message": str(e), "upstreamStatus": e.upstream_status})
 
 
 # ---------------------------------------------------------------------------
-# Entry point (dev only – use uvicorn CLI in production)
+# Transaction History
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/transactions/history", tags=["Transactions"])
+async def get_transaction_history(
+    request:        Request,
+    account_number: str           = Query(..., alias="accountNumber"),
+    from_date:      Optional[str] = Query(default=None, alias="fromDate",  description="YYYY-MM-DD"),
+    to_date:        Optional[str] = Query(default=None, alias="toDate",    description="YYYY-MM-DD"),
+):
+    """Fetch transaction history. Just pass accountNumber."""
+    req_id = str(uuid.uuid4())
+    log.info("[%s] GET /transactions/history | accountNumber=%s", req_id, account_number)
+    hub: HSBCHubClient = request.app.state.hsbc
+    try:
+        result = await hub.get_transaction_history(account_number, from_date=from_date, to_date=to_date)
+        return {"requestId": req_id, "data": result}
+    except HSBCError as e:
+        log.error("[%s] %s", req_id, e)
+        raise HTTPException(e.status_code, detail={"requestId": req_id, "error": "upstream_error",
+                                                    "message": str(e), "upstreamStatus": e.upstream_status})
+
+
+# ---------------------------------------------------------------------------
+# Apply Account Hold
+# ---------------------------------------------------------------------------
+
+class ApplyHoldDetails(BaseModel):
+    accountNumber:        str            = Field(..., description="e.g. INHSBC011019072006")
+    accountCurrencyCode:  str            = Field(..., description="e.g. INR")
+    holdTillExpiredDate:  str            = Field(..., description="YYYY-MM-DD")
+    holdType:             str            = Field(..., description="e.g. B")
+    holdCurrency:         str            = Field(..., description="e.g. INR")
+    holdAmount:           str            = Field(..., description="e.g. 28.28")
+    customerNumber:       Optional[str]  = None
+    globalUserId:         Optional[str]  = None
+    hsbcnetCustomerId:    Optional[str]  = None
+    holdNarrative1:       Optional[str]  = None
+    holdNarrative2:       Optional[str]  = None
+    holdNarrative3:       Optional[str]  = None
+    holdNarrative4:       Optional[str]  = None
+    sequenceNumber:       Optional[str]  = None
+    holdValueDate:        Optional[str]  = None
+    holdDepositDate:      Optional[str]  = None
+    clearingArea:         Optional[str]  = None
+    clearingNumber:       Optional[str]  = None
+    balanceCheckRequired: Optional[str]  = None
+    onlineOfflineFlag:    Optional[str]  = None
+    debitCardNumber:      Optional[str]  = None
+
+class ApplyHoldRequest(BaseModel):
+    applyHoldDetails: ApplyHoldDetails
+
+
+@app.post("/api/v1/accounts/apply-hold", tags=["Accounts"])
+async def apply_account_hold(request: Request, body: ApplyHoldRequest = Body(...)):
+    """Apply a hold on an HSBC account. Just pass the hold details."""
+    req_id = str(uuid.uuid4())
+    log.info("[%s] POST /accounts/apply-hold | accountNumber=%s amount=%s",
+             req_id, body.applyHoldDetails.accountNumber, body.applyHoldDetails.holdAmount)
+    hub: HSBCHubClient = request.app.state.hsbc
+    try:
+        result = await hub.apply_account_hold(body.applyHoldDetails.model_dump(exclude_none=True))
+        return {"requestId": req_id, "data": result}
+    except HSBCError as e:
+        log.error("[%s] %s", req_id, e)
+        raise HTTPException(e.status_code, detail={"requestId": req_id, "error": "upstream_error",
+                                                    "message": str(e), "upstreamStatus": e.upstream_status})
+
+
+# ---------------------------------------------------------------------------
+# Demand Deposit Account Enquiry
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/accounts/demand-deposit", tags=["Accounts"])
+async def get_demand_deposit_account(
+    request:             Request,
+    hub_customer_number: str           = Query(..., alias="hubCustomerNumber"),
+    sensitive_data:      Optional[str] = Query(default=None, alias="sensitiveData",
+                                               description='e.g. [{"key":"1111","value":"INHSBC003297637"}]'),
+):
+    """Fetch demand deposit account details. Just pass hubCustomerNumber."""
+    req_id = str(uuid.uuid4())
+    log.info("[%s] GET /accounts/demand-deposit | hubCustomerNumber=%s", req_id, hub_customer_number)
+    hub: HSBCHubClient = request.app.state.hsbc
+    try:
+        result = await hub.get_demand_deposit_account(hub_customer_number, sensitive_data=sensitive_data)
+        return {"requestId": req_id, "data": result}
+    except HSBCError as e:
+        log.error("[%s] %s", req_id, e)
+        raise HTTPException(e.status_code, detail={"requestId": req_id, "error": "upstream_error",
+                                                    "message": str(e), "upstreamStatus": e.upstream_status})
+
+
+# ---------------------------------------------------------------------------
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-        reload=True,
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
