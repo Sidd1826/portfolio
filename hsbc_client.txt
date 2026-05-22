@@ -46,7 +46,45 @@ class HSBCHubClient:
     """One session, three endpoints. Each gets its own trust token from config."""
 
     def __init__(self) -> None:
+        self._validate_config()
         self._session = self._build_session()
+
+    @staticmethod
+    def _validate_config() -> None:
+        """Fail fast at startup if any base URL looks broken.
+
+        The most common mistake is copy-pasting a curl URL that has query
+        params or path variables baked into the base URL string — e.g.
+        '.../history?accountNumber=abc123' or '.../history/accountNumber-abc'
+        instead of just '.../history'.
+        """
+        checks = {
+            "HSBC_TRANSACTION_HISTORY_URL": config.HSBC_TRANSACTION_HISTORY_URL,
+            "HSBC_APPLY_HOLD_URL":          config.HSBC_APPLY_HOLD_URL,
+            "HSBC_DEMAND_DEPOSIT_URL":      config.HSBC_DEMAND_DEPOSIT_URL,
+        }
+        errors = []
+        for name, url in checks.items():
+            if not url:
+                errors.append(f"{name} is empty")
+                continue
+            if "?" in url:
+                errors.append(
+                    f"{name} contains '?' — query params must NOT be in the base URL "
+                    f"(they are added dynamically). Got: {url}"
+                )
+            if any(bad in url for bad in ("accountNumber", "hubCustomerNumber")):
+                errors.append(
+                    f"{name} appears to have a path variable baked in. "
+                    f"The base URL must end at the endpoint path. Got: {url}"
+                )
+        if errors:
+            for e in errors:
+                log.error("CONFIG ERROR: %s", e)
+            raise RuntimeError(
+                "HSBCHubClient misconfigured — fix the env vars above before starting:\n"
+                + "\n".join(errors)
+            )
 
     @staticmethod
     def _build_session() -> requests.Session:
@@ -70,6 +108,15 @@ class HSBCHubClient:
         )
         s.mount("http://",  adapter)
         s.mount("https://", adapter)
+
+        log.info(
+            "HSBCHubClient session ready | proxy=%s verify=False "
+            "connect_timeout=%.0fs read_timeout=%.0fs retries=%d",
+            config.PROXY_URL or "DISABLED",
+            config.HTTP_CONNECT_TIMEOUT,
+            config.HTTP_READ_TIMEOUT,
+            config.HTTP_MAX_RETRIES,
+        )
         return s
 
     def close(self) -> None:
