@@ -1,10 +1,19 @@
 """
 config.py — Central config. Everything comes from env vars so Cloud Run
 revisions can set them via Secret Manager / --set-env-vars.
+
+Locally, values are loaded from a .env file via python-dotenv.
+On Cloud Run, os.environ is already populated — dotenv is a no-op.
 """
 from __future__ import annotations
 
 import os
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
 
 
 def _env(name: str, default: str = "") -> str:
@@ -22,10 +31,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Network — proxy applies to BOTH httpx (UPI) and requests (HSBC)
+# Network
 # ---------------------------------------------------------------------------
-
-PROXY_URL: str = _env("PROXY_URL", "")
 
 HTTP_CONNECT_TIMEOUT: float = _env_float("HTTP_CONNECT_TIMEOUT", 10.0)
 HTTP_READ_TIMEOUT:    float = _env_float("HTTP_READ_TIMEOUT",    30.0)
@@ -33,7 +40,7 @@ HTTP_MAX_RETRIES:     int   = _env_int("HTTP_MAX_RETRIES", 2)
 
 
 # ---------------------------------------------------------------------------
-# UPI — HSBC two-step (login -> secure call)
+# UPI
 # ---------------------------------------------------------------------------
 
 UPI_BASE_URL:    str = _env("UPI_BASE_URL",    "https://upi-uat-mob.hsbc.co.in")
@@ -72,8 +79,7 @@ HSBC_DEMAND_DEPOSIT_URL: str = _env(
 
 
 # ---------------------------------------------------------------------------
-# HSBC E2E Trust Tokens — one per API (each curl has a distinct JWT)
-# All three are SECRET — load from Secret Manager in prod.
+# HSBC E2E Trust Tokens — one per API
 # ---------------------------------------------------------------------------
 
 HSBC_TRUST_TOKEN_TRANSACTION_HISTORY: str = _env("HSBC_TRUST_TOKEN_TRANSACTION_HISTORY", "")
@@ -82,7 +88,7 @@ HSBC_TRUST_TOKEN_DEMAND_DEPOSIT:      str = _env("HSBC_TRUST_TOKEN_DEMAND_DEPOSI
 
 
 # ---------------------------------------------------------------------------
-# Static correlation IDs (per requirement: do not change at runtime)
+# Static correlation IDs
 # ---------------------------------------------------------------------------
 
 HSBC_REQUEST_CORRELATION_ID: str = _env(

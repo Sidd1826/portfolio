@@ -38,27 +38,22 @@ log = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("=== Starting HSBC MHA Gateway ===")
-    log.info("PROXY  : %s", config.PROXY_URL or "DISABLED")
     log.info("VERIFY : False (HSBC internal CA)")
     log.info("TIMEOUT: connect=%.0fs read=%.0fs",
              config.HTTP_CONNECT_TIMEOUT, config.HTTP_READ_TIMEOUT)
 
-    # httpx async client — UPI only
-    httpx_kwargs: dict[str, Any] = {
-        "verify":  False,
-        "timeout": httpx.Timeout(
+    # httpx async client — UPI only, no proxy
+    http = httpx.AsyncClient(
+        verify=False,
+        timeout=httpx.Timeout(
             connect=config.HTTP_CONNECT_TIMEOUT,
             read=config.HTTP_READ_TIMEOUT,
             write=config.HTTP_READ_TIMEOUT,
             pool=config.HTTP_CONNECT_TIMEOUT,
         ),
-        "limits": httpx.Limits(max_connections=100, max_keepalive_connections=20),
-    }
-    if config.PROXY_URL:
-        httpx_kwargs["proxy"] = config.PROXY_URL
-    http = httpx.AsyncClient(**httpx_kwargs)
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
 
-    # requests-based HSBC client (sync, called via asyncio.to_thread)
     hsbc = HSBCHubClient()
 
     app.state.upi  = UPIClient(http=http, cipher=AESCipher(config.UPI_AES_KEY_HEX))
@@ -87,7 +82,7 @@ async def _unhandled(_req: Request, exc: Exception):
 
 
 # ---------------------------------------------------------------------------
-# Health  (Cloud Run uses this for startup/liveness)
+# Health
 # ---------------------------------------------------------------------------
 
 @app.get("/health", tags=["Health"])
@@ -152,7 +147,6 @@ async def get_transaction_history(
 
 # ---------------------------------------------------------------------------
 # Apply Account Hold — pass-through body
-# Whatever JSON the caller sends, we forward to HSBC verbatim.
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/accounts/apply-hold", tags=["Accounts"])
@@ -170,12 +164,9 @@ async def apply_account_hold(
     }]),
 ):
     req_id = str(uuid.uuid4())
-    # Pull a couple of fields for logging — but never log the full body
-    # (could contain account numbers, narratives, etc).
     details = body.get("applyHoldDetails", body) if isinstance(body, dict) else {}
     log.info("[%s] POST /accounts/apply-hold accountNumber=%s amount=%s",
              req_id, details.get("accountNumber"), details.get("holdAmount"))
-
     hub: HSBCHubClient = request.app.state.hsbc
     try:
         result = await asyncio.to_thread(hub.apply_account_hold, body)
@@ -216,7 +207,7 @@ async def get_demand_deposit_account(
 
 
 # ---------------------------------------------------------------------------
-# Entry point — Cloud Run sets PORT env var
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
