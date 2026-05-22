@@ -4,4 +4,4 @@ httpx==0.28.1
 requests==2.32.3
 urllib3==2.3.0
 pydantic==2.10.4
-pycryptodome==3.21.0
+cryptography==44.0.0

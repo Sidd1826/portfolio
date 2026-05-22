@@ -33,10 +33,21 @@ HTTP_MAX_RETRIES:     int   = _env_int("HTTP_MAX_RETRIES", 2)
 
 
 # ---------------------------------------------------------------------------
-# UPI
+# UPI — HSBC two-step (login -> secure call)
 # ---------------------------------------------------------------------------
 
+UPI_BASE_URL:    str = _env("UPI_BASE_URL",    "https://upi-uat-mob.hsbc.co.in")
+UPI_LOGIN_PATH:  str = _env("UPI_LOGIN_PATH",  "/sha/api/auth/login")
+UPI_SECURE_PATH: str = _env("UPI_SECURE_PATH", "/mha/secure/sha/check")
+
+UPI_USERNAME:    str = _env("UPI_USERNAME", "")
+UPI_PASSWORD:    str = _env("UPI_PASSWORD", "")
 UPI_AES_KEY_HEX: str = _env("UPI_AES_KEY_HEX", "")
+
+# Refresh token this many seconds before its `exp` claim.
+TOKEN_REFRESH_LEEWAY_SEC: int = _env_int("TOKEN_REFRESH_LEEWAY_SEC", 60)
+# Fallback TTL when JWT has no parseable `exp`.
+TOKEN_DEFAULT_TTL_SEC:    int = _env_int("TOKEN_DEFAULT_TTL_SEC", 900)
 
 
 # ---------------------------------------------------------------------------
