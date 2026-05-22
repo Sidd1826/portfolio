@@ -44,14 +44,12 @@ UPI_USERNAME:    str = _env("UPI_USERNAME", "")
 UPI_PASSWORD:    str = _env("UPI_PASSWORD", "")
 UPI_AES_KEY_HEX: str = _env("UPI_AES_KEY_HEX", "")
 
-# Refresh token this many seconds before its `exp` claim.
 TOKEN_REFRESH_LEEWAY_SEC: int = _env_int("TOKEN_REFRESH_LEEWAY_SEC", 60)
-# Fallback TTL when JWT has no parseable `exp`.
 TOKEN_DEFAULT_TTL_SEC:    int = _env_int("TOKEN_DEFAULT_TTL_SEC", 900)
 
 
 # ---------------------------------------------------------------------------
-# HSBC Hub endpoints (from the curls). Override via env in non-pre-prod.
+# HSBC Hub endpoints
 # ---------------------------------------------------------------------------
 
 HSBC_TRANSACTION_HISTORY_URL: str = _env(
@@ -74,20 +72,18 @@ HSBC_DEMAND_DEPOSIT_URL: str = _env(
 
 
 # ---------------------------------------------------------------------------
-# Static tokens / correlation IDs (per requirement: do not change at runtime).
-# In real prod, load HSBC_E2E_TRUST_TOKEN from Secret Manager.
+# HSBC E2E Trust Tokens — one per API (each curl has a distinct JWT)
+# All three are SECRET — load from Secret Manager in prod.
 # ---------------------------------------------------------------------------
 
-HSBC_E2E_TRUST_TOKEN: str = _env(
-    "HSBC_E2E_TRUST_TOKEN",
-    # Static JWT from the curls — replace via env var in deployment.
-    "eyJ0eXAiOiJKV1QiLCJraWQiOiJFMkVfVFJVU1RfU0FBU19FVTAxX1BQUk9EX0FMSUFTIiwic2N2IjoiMS4w"
-    "IiwicHNjaCI6InVybjphaW06dG9rZW46aW50ZXJuYWwiLCJhbGciOiJSUzI1NiIsInRrdiI6IjEuMCJ9."
-    "eyJzdWIiOiJkdW1teSIsImdycCI6WyJkdW1teS1ncm91cDEiLCJkdW1teS1ncm91cDEiXSwiaXNzIjoiaHR0"
-    "cHM6Ly93d3cuaHNiYy5jb20vcmJ3bS9kdHAiLCJleHAiOjE4NjQ0NzQzNTgsImlhdCI6MTcwNjc5NDM1OCwi"
-    "anRpIjoiOGU1MmMxOGUtNmQ3My00YWU1LTkwYzctMzM4ZTQyYzJmZjhkIiwic2l0IjoiYWQ6c3ZjOnByaW5j"
-    "aXBhbCJ9.signature_placeholder_replace_via_env",
-)
+HSBC_TRUST_TOKEN_TRANSACTION_HISTORY: str = _env("HSBC_TRUST_TOKEN_TRANSACTION_HISTORY", "")
+HSBC_TRUST_TOKEN_APPLY_HOLD:          str = _env("HSBC_TRUST_TOKEN_APPLY_HOLD", "")
+HSBC_TRUST_TOKEN_DEMAND_DEPOSIT:      str = _env("HSBC_TRUST_TOKEN_DEMAND_DEPOSIT", "")
+
+
+# ---------------------------------------------------------------------------
+# Static correlation IDs (per requirement: do not change at runtime)
+# ---------------------------------------------------------------------------
 
 HSBC_REQUEST_CORRELATION_ID: str = _env(
     "HSBC_REQUEST_CORRELATION_ID",
