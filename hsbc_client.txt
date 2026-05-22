@@ -185,8 +185,9 @@ class HSBCHubClient:
     def get_transaction_history(
         self,
         account_number: str,
-        from_date: Optional[str] = None,
-        to_date:   Optional[str] = None,
+        from_date:      Optional[str] = None,
+        to_date:        Optional[str] = None,
+        sensitive_data: str = "",
     ) -> dict[str, Any]:
         params: dict[str, str] = {"accountNumber": account_number}
         if from_date:
@@ -194,12 +195,12 @@ class HSBCHubClient:
         if to_date:
             params["toDate"] = to_date
 
-        sensitive = json.dumps([{"key": account_number, "value": account_number}], separators=(",", ":"))
-
+        # sensitive_data is always passed from the request body (JSON) by main.py.
+        # Format: '[{"key":"<accountNumber>","value":"<real HSBC account>"}]'
         return self._do(
             method="GET",
             url=config.HSBC_TRANSACTION_HISTORY_URL,
-            headers=self._headers_transaction_history(sensitive),
+            headers=self._headers_transaction_history(sensitive_data),
             params=params,
             op="transaction_history",
         )
@@ -226,17 +227,14 @@ class HSBCHubClient:
     def get_demand_deposit_account(
         self,
         hub_customer_number: str,
-        sensitive_data: Optional[str] = None,
+        sensitive_data: str = "",
     ) -> dict[str, Any]:
-        sensitive = sensitive_data or json.dumps(
-            [{"key": hub_customer_number, "value": hub_customer_number}],
-            separators=(",", ":"),
-        )
-
+        # sensitive_data is always passed from the request body (JSON) by main.py.
+        # Format: '[{"key":"<hubCustomerNumber>","value":"<real HSBC account>"}]'
         return self._do(
             method="GET",
             url=config.HSBC_DEMAND_DEPOSIT_URL,
-            headers=self._headers_demand_deposit(sensitive),
+            headers=self._headers_demand_deposit(sensitive_data),
             params={"hubCustomerNumber": hub_customer_number},
             op="demand_deposit",
         )
