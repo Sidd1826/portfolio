@@ -5,8 +5,11 @@ Routes
   GET  /health
   POST /api/v1/upi/secure
   GET  /api/v1/transactions/history?accountNumber=...&fromDate=...&toDate=...
-  POST /api/v1/accounts/apply-hold        (body forwarded as-is)
-  GET  /api/v1/accounts/demand-deposit?hubCustomerNumber=...&sensitiveData=...
+         body: {"sensitiveData": [{"key": "...", "value": "INHSBC..."}]}
+  POST /api/v1/accounts/apply-hold
+         body: {"applyHoldDetails": {...}} forwarded as-is
+  GET  /api/v1/accounts/demand-deposit?hubCustomerNumber=...
+         body: {"sensitiveData": [{"key": "...", "value": "INHSBC..."}]}
 
 Run locally:
   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -14,6 +17,7 @@ Run locally:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -22,6 +26,7 @@ from typing import Any, Optional
 import httpx
 from fastapi import FastAPI, Body, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 import config
 from hsbc_client import HSBCError, HSBCHubClient
@@ -81,15 +86,27 @@ async def _unhandled(_req: Request, exc: Exception):
 
 
 def _hsbc_error_detail(req_id: str, e: HSBCError) -> dict[str, Any]:
-    """Build the error detail dict — always includes upstreamBody so the
-    caller can see exactly what HSBC said without digging through logs."""
     return {
-        "requestId":    req_id,
-        "error":        "upstream_error",
-        "message":      str(e),
+        "requestId":      req_id,
+        "error":          "upstream_error",
+        "message":        str(e),
         "upstreamStatus": e.upstream_status,
-        "upstreamBody": e.upstream_body,
+        "upstreamBody":   e.upstream_body,
     }
+
+
+# ---------------------------------------------------------------------------
+# Shared request body model for sensitive data
+# Used by both GET routes that need X-HSBC-Sensitive-Data forwarded to HSBC.
+# ---------------------------------------------------------------------------
+
+class SensitiveDataBody(BaseModel):
+    sensitiveData: list[dict[str, str]] = Field(
+        ...,
+        description='key = value used in accountNumber/hubCustomerNumber query param, '
+                    'value = real HSBC internal account number',
+        examples=[[{"key": "abc123", "value": "INHSBC500021738001"}]],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +147,7 @@ async def upi_secure(
 
 
 # ---------------------------------------------------------------------------
-# Transaction History
+# Transaction History (GET + JSON body for sensitiveData)
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/transactions/history", tags=["Transactions"])
@@ -139,13 +156,18 @@ async def get_transaction_history(
     account_number: str           = Query(..., alias="accountNumber"),
     from_date:      Optional[str] = Query(default=None, alias="fromDate", description="YYYY-MM-DD"),
     to_date:        Optional[str] = Query(default=None, alias="toDate",   description="YYYY-MM-DD"),
+    body:           SensitiveDataBody = Body(...),
 ):
     req_id = str(uuid.uuid4())
     log.info("[%s] GET /transactions/history accountNumber=%s", req_id, account_number)
+
+    # Serialise list -> compact JSON string for the HSBC header
+    sensitive_data = json.dumps(body.sensitiveData, separators=(",", ":"))
+
     hub: HSBCHubClient = request.app.state.hsbc
     try:
         result = await asyncio.to_thread(
-            hub.get_transaction_history, account_number, from_date, to_date
+            hub.get_transaction_history, account_number, from_date, to_date, sensitive_data
         )
         return {"requestId": req_id, "data": result}
     except HSBCError as e:
@@ -154,7 +176,7 @@ async def get_transaction_history(
 
 
 # ---------------------------------------------------------------------------
-# Apply Account Hold — pass-through body
+# Apply Account Hold — pass-through body (no sensitiveData needed)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/accounts/apply-hold", tags=["Accounts"])
@@ -162,12 +184,12 @@ async def apply_account_hold(
     request: Request,
     body:    dict[str, Any] = Body(..., examples=[{
         "applyHoldDetails": {
-            "accountNumber": "INHSBC011019072006",
+            "accountNumber":       "INHSBC011019072006",
             "accountCurrencyCode": "INR",
             "holdTillExpiredDate": "2028-12-31",
-            "holdType": "B",
-            "holdCurrency": "INR",
-            "holdAmount": "28.28",
+            "holdType":            "B",
+            "holdCurrency":        "INR",
+            "holdAmount":          "28.28",
         }
     }]),
 ):
@@ -185,18 +207,20 @@ async def apply_account_hold(
 
 
 # ---------------------------------------------------------------------------
-# Demand Deposit Account Enquiry
+# Demand Deposit Account Enquiry (GET + JSON body for sensitiveData)
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/accounts/demand-deposit", tags=["Accounts"])
 async def get_demand_deposit_account(
     request:             Request,
-    hub_customer_number: str           = Query(..., alias="hubCustomerNumber"),
-    sensitive_data:      Optional[str] = Query(default=None, alias="sensitiveData",
-                                               description='e.g. [{"key":"1111","value":"INHSBC003297637"}]'),
+    hub_customer_number: str = Query(..., alias="hubCustomerNumber"),
+    body:                SensitiveDataBody = Body(...),
 ):
     req_id = str(uuid.uuid4())
     log.info("[%s] GET /accounts/demand-deposit hubCustomerNumber=%s", req_id, hub_customer_number)
+
+    sensitive_data = json.dumps(body.sensitiveData, separators=(",", ":"))
+
     hub: HSBCHubClient = request.app.state.hsbc
     try:
         result = await asyncio.to_thread(
