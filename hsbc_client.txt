@@ -1,181 +1,305 @@
 """
-hsbc_client.py - HSBC Hub API client.
+hsbc_client.py — Sync requests client for HSBC Hub APIs.
 
-All headers are built from config — internal callers pass only business data.
+Three endpoints, each with its own hardcoded header set (per the curls).
+Shared concerns: proxy, verify=False, timeouts, retries, error wrapping.
+
+Why sync requests (not httpx async)?
+  - HSBC Hub hosts behave more predictably with the corporate proxy + custom CA
+    chain via `requests` + urllib3. We run these in a threadpool from FastAPI
+    (see main.py) so the event loop stays free.
 """
 from __future__ import annotations
 
-import uuid
+import json
 from typing import Any, Optional
+from urllib.parse import urlencode
 
-import httpx
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import config
 from logger import get_logger
 
-logger = get_logger(__name__)
+log = get_logger(__name__)
 
+# Suppress the InsecureRequestWarning that fires on every verify=False call.
+# HSBC internal hosts use an internal CA we don't bundle; verify=False is
+# intentional and gated to *.hsbc hosts via config.
+requests.packages.urllib3.disable_warnings(  # type: ignore[attr-defined]
+    requests.packages.urllib3.exceptions.InsecureRequestWarning  # type: ignore[attr-defined]
+)
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
 
 class HSBCError(Exception):
-    def __init__(self, message: str, status_code: int = 502, upstream_status: Optional[int] = None):
+    """Raised when an HSBC Hub upstream call fails.
+
+    `status_code`     -> HTTP status we should surface to *our* client
+    `upstream_status` -> the actual status returned by HSBC (None on network error)
+    """
+    def __init__(self, message: str, *, status_code: int = 502, upstream_status: Optional[int] = None):
         super().__init__(message)
-        self.status_code     = status_code
+        self.status_code = status_code
         self.upstream_status = upstream_status
 
 
+# ---------------------------------------------------------------------------
+# Shared constants (the JWT trust token + correlation IDs are static per
+# your instruction — these never change at runtime)
+# ---------------------------------------------------------------------------
+
+# NOTE: This JWT is the dev/UAT static trust token from the curls.
+# Move to Secret Manager / env var before prod-prod.
+_E2E_TRUST_TOKEN = config.HSBC_E2E_TRUST_TOKEN
+
+_STATIC_REQUEST_CORRELATION_ID = config.HSBC_REQUEST_CORRELATION_ID
+_STATIC_SESSION_CORRELATION_ID = config.HSBC_SESSION_CORRELATION_ID
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
 class HSBCHubClient:
+    """One session, three endpoints. Reuse keepalive connections across calls."""
 
-    def __init__(self, http: httpx.AsyncClient) -> None:
-        self._http     = http
-        self._txn_url  = f"{config.TXN_HISTORY_BASE_URL.rstrip('/')}{config.TXN_HISTORY_PATH}"
-        self._hold_url = f"{config.ACCT_HOLD_BASE_URL.rstrip('/')}{config.ACCT_HOLD_PATH}"
-        self._dda_url  = f"{config.DDA_BASE_URL.rstrip('/')}{config.DDA_PATH}"
-        logger.info("HSBCHubClient ready | txn=%s | hold=%s | dda=%s",
-                    self._txn_url, self._hold_url, self._dda_url)
+    def __init__(self) -> None:
+        self._session = self._build_session()
 
-    # ------------------------------------------------------------------ #
-    # 1. Transaction History
-    # ------------------------------------------------------------------ #
-    async def get_transaction_history(
+    # ------------------------------------------------------------------
+    # Session
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_session() -> requests.Session:
+        s = requests.Session()
+        s.verify = False  # HSBC internal CA, intentional
+
+        if config.PROXY_URL:
+            s.proxies = {"http": config.PROXY_URL, "https": config.PROXY_URL}
+
+        retry = Retry(
+            total=config.HTTP_MAX_RETRIES,
+            backoff_factor=0.5,
+            status_forcelist=(502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry,
+            pool_connections=20,
+            pool_maxsize=50,
+        )
+        s.mount("http://",  adapter)
+        s.mount("https://", adapter)
+        return s
+
+    def close(self) -> None:
+        self._session.close()
+
+    # ------------------------------------------------------------------
+    # Per-endpoint header builders
+    # Each curl in the spec has its OWN header set — we don't share them
+    # except for the trust token + correlation IDs.
+    # ------------------------------------------------------------------
+
+    def _headers_transaction_history(self, sensitive_data: str) -> dict[str, str]:
+        return {
+            "X-HSBC-CB-Staff-User-Id":          "DMS1",
+            "X-HSBC-Chnl-CountryCode":          "IN",
+            "X-HSBC-Chnl-Group-Member":         "HSBC",
+            "X-HSBC-Client-Id":                 "SBI",
+            "X-HSBC-Client-Secret":             "SBI1",
+            "X-HSBC-Consumer-Id":               "INHSBC_HUB_DMS",
+            "X-HSBC-E2E-Trust-Token":           _E2E_TRUST_TOKEN,
+            "X-HSBC-GBGF":                      "RBWM",
+            "X-HSBC-Global-Channel-Id":         "OHB",
+            "X-HSBC-Request-Correlation-Id":    _STATIC_REQUEST_CORRELATION_ID,
+            "X-HSBC-Sensitive-Data":            sensitive_data,
+            "X-HSBC-Session-Correlation-Id":    _STATIC_SESSION_CORRELATION_ID,
+            "X-HSBC-Src-UserAgent":             "Mozilla",
+            "X-HSBC-Target-System-Environment-Id": "UAT001",
+            "X-HSBC-User-Id":                   "user123",
+            "X-HSBC-Workstation-Id":            "DMS1",
+        }
+
+    def _headers_apply_hold(self) -> dict[str, str]:
+        return {
+            "Content-Type":                     "application/json",
+            "X-HSBC-CB-Client-Id":              "SBI",
+            "X-HSBC-CB-Client-Secret":          "SBI11",
+            "X-HSBC-CB-Staff-User-Id":          "API9",
+            "X-HSBC-Chnl-CountryCode":          "IN",
+            "X-HSBC-Chnl-Group-Member":         "HSBC",
+            "X-HSBC-Consumer-Id":               "INHSBC_HUB_MHA",
+            "X-HSBC-E2E-Trust-Token":           _E2E_TRUST_TOKEN,
+            "X-HSBC-GBGF":                      "WPB",
+            "X-HSBC-Global-Channel-Id":         "STAFFWEB",
+            "X-HSBC-Request-Correlation-Id":    _STATIC_REQUEST_CORRELATION_ID,
+            "X-HSBC-Session-Correlation-Id":    _STATIC_SESSION_CORRELATION_ID,
+            "X-HSBC-Source-System-Id":          "237139",
+            "X-HSBC-Src-Device-Id":             "255.255.222.222",
+            "X-HSBC-Src-UserAgent":             "Mozilla",
+            "X-HSBC-Target-System-Environment-Id": "F1SYS",
+            "X-HSBC-User-Id":                   "",
+            "X-HSBC-Workstation-Id":            "API9",
+        }
+
+    def _headers_demand_deposit(self, sensitive_data: str) -> dict[str, str]:
+        return {
+            "Content-Type":                     "application/json",
+            "HSBC-CLIENT-IP":                   "255.255.222.222",
+            "User-Agent":                       "insomnia/11.5.0",
+            "X-HSBC-CB-Staff-User-Id":          "API9",
+            "X-HSBC-Chnl-CountryCode":          "IN",
+            "X-HSBC-Chnl-Group-Member":         "HSBC",
+            "X-HSBC-Client-Id":                 "SBI11",
+            "X-HSBC-Client-Secret":             "WEB",
+            "X-HSBC-Consumer-Id":               "INHSBC_HUB_MHA",
+            "X-HSBC-E2E-Trust-Token":           _E2E_TRUST_TOKEN,
+            "X-HSBC-GBGF":                      "RBWM",
+            "X-HSBC-Global-Channel-Id":         "MOBILE",
+            "X-HSBC-Request-Correlation-Id":    _STATIC_REQUEST_CORRELATION_ID,
+            "X-HSBC-Session-Correlation-Id":    _STATIC_SESSION_CORRELATION_ID,
+            "X-HSBC-Source-System-Id":          "",
+            "X-HSBC-Src-UserAgent":             "",
+            "X-HSBC-Target-System-Environment-Id": "",
+            "X-HSBC-User-Id":                   "API9",
+            "X-HSBC-Workstation-Id":            "API9",
+            "x-hsbc-sensitive-data":            sensitive_data,
+        }
+
+    # ------------------------------------------------------------------
+    # Endpoint #1 — Transaction History (GET)
+    # ------------------------------------------------------------------
+
+    def get_transaction_history(
         self,
         account_number: str,
-        extra_params:   Optional[dict[str, str]] = None,
+        from_date: Optional[str] = None,
+        to_date:   Optional[str] = None,
     ) -> dict[str, Any]:
+        params: dict[str, str] = {"accountNumber": account_number}
+        if from_date:
+            params["fromDate"] = from_date
+        if to_date:
+            params["toDate"] = to_date
 
-        headers = {
-            "Content-Type":                        "application/json",
-            "Accept":                              "application/json",
-            "X-HSBC-CB-Staff-User-Id":             config.TXN_STAFF_USER_ID,
-            "X-HSBC-Chnl-CountryCode":             config.TXN_COUNTRY_CODE,
-            "X-HSBC-Chnl-Group-Member":            config.TXN_GROUP_MEMBER,
-            "X-HSBC-Client-Id":                    config.TXN_CLIENT_ID,
-            "X-HSBC-Client-Secret":                config.TXN_CLIENT_SECRET,
-            "X-HSBC-Consumer-Id":                  config.TXN_CONSUMER_ID,
-            "X-HSBC-E2E-Trust-Token":              config.TXN_E2E_TRUST_TOKEN,
-            "X-HSBC-GBGF":                         config.TXN_GBGF,
-            "X-HSBC-Global-Channel-Id":            config.TXN_GLOBAL_CHANNEL_ID,
-            "X-HSBC-Request-Correlation-Id":       str(uuid.uuid4()),
-            "X-HSBC-Session-Correlation-Id":       str(uuid.uuid4()),
-            "X-HSBC-Src-UserAgent":               config.TXN_SRC_USER_AGENT,
-            "X-HSBC-Target-System-Environment-Id": config.TXN_TARGET_SYSTEM_ENV,
-            "X-HSBC-User-Id":                      config.TXN_USER_ID,
-            "X-HSBC-Workstation-Id":               config.TXN_WORKSTATION_ID,
-        }
+        # X-HSBC-Sensitive-Data uses the accountNumber as the value of the
+        # ad-hoc key (matches the curl: [{"key":"abc123","value":"INHSBC..."}]).
+        sensitive = json.dumps([{"key": account_number, "value": account_number}], separators=(",", ":"))
 
-        params = {"accountNumber": account_number}
-        if extra_params:
-            params.update(extra_params)
+        return self._do(
+            method="GET",
+            url=config.HSBC_TRANSACTION_HISTORY_URL,
+            headers=self._headers_transaction_history(sensitive),
+            params=params,
+            op="transaction_history",
+        )
 
-        logger.info("GET transaction history | accountNumber=%s", account_number)
-        try:
-            resp = await self._http.get(self._txn_url, headers=headers, params=params)
-        except httpx.HTTPError as e:
-            logger.exception("Transaction history network error")
-            raise HSBCError(f"Transaction history network error: {type(e).__name__}") from e
+    # ------------------------------------------------------------------
+    # Endpoint #2 — Apply Account Hold (POST)
+    # Body is pass-through: whatever main.py hands us, we forward.
+    # ------------------------------------------------------------------
 
-        logger.info("Transaction history response: HTTP %d", resp.status_code)
-        return self._handle(resp, "Transaction history")
+    def apply_account_hold(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # Caller may pass either the inner dict or the wrapped {"applyHoldDetails": ...}.
+        # Hub expects the wrapped form.
+        body = payload if "applyHoldDetails" in payload else {"applyHoldDetails": payload}
 
-    # ------------------------------------------------------------------ #
-    # 2. Apply Account Hold
-    # ------------------------------------------------------------------ #
-    async def apply_account_hold(
-        self,
-        apply_hold_details: dict[str, Any],
-    ) -> dict[str, Any]:
+        return self._do(
+            method="POST",
+            url=config.HSBC_APPLY_HOLD_URL,
+            headers=self._headers_apply_hold(),
+            json_body=body,
+            op="apply_hold",
+        )
 
-        headers = {
-            "Content-Type":                        "application/json",
-            "Accept":                              "application/json",
-            "X-HSBC-CB-Staff-User-Id":             config.HOLD_STAFF_USER_ID,
-            "X-HSBC-Chnl-CountryCode":             config.HOLD_COUNTRY_CODE,
-            "X-HSBC-Chnl-Group-Member":            config.HOLD_GROUP_MEMBER,
-            "X-HSBC-Client-Id":                    config.HOLD_CLIENT_ID,
-            "X-HSBC-Client-Secret":                config.HOLD_CLIENT_SECRET,
-            "X-HSBC-Consumer-Id":                  config.HOLD_CONSUMER_ID,
-            "X-HSBC-E2E-Trust-Token":              config.HOLD_E2E_TRUST_TOKEN,
-            "X-HSBC-GBGF":                         config.HOLD_GBGF,
-            "X-HSBC-Global-Channel-Id":            config.HOLD_GLOBAL_CHANNEL_ID,
-            "X-HSBC-Request-Correlation-Id":       str(uuid.uuid4()),
-            "X-HSBC-Session-Correlation-Id":       str(uuid.uuid4()),
-            "X-HSBC-Source-System-Id":             config.HOLD_SOURCE_SYSTEM_ID,
-            "X-HSBC-Src-Device-Id":               config.HOLD_SRC_DEVICE_ID,
-            "X-HSBC-Src-UserAgent":               config.HOLD_SRC_USER_AGENT,
-            "X-HSBC-Target-System-Environment-Id": config.HOLD_TARGET_SYSTEM_ENV,
-            "X-HSBC-User-Id":                      config.HOLD_USER_ID,
-            "X-HSBC-Workstation-Id":               config.HOLD_WORKSTATION_ID,
-            "HSBC-CLIENT-IP":                      config.HOLD_SRC_DEVICE_ID,
-        }
+    # ------------------------------------------------------------------
+    # Endpoint #3 — Demand Deposit Account Enquiry (GET)
+    # ------------------------------------------------------------------
 
-        logger.info("POST apply account hold | accountNumber=%s", apply_hold_details.get("accountNumber"))
-        try:
-            resp = await self._http.post(
-                self._hold_url,
-                headers=headers,
-                json={"applyHoldDetails": apply_hold_details},
-            )
-        except httpx.HTTPError as e:
-            logger.exception("Apply account hold network error")
-            raise HSBCError(f"Apply account hold network error: {type(e).__name__}") from e
-
-        logger.info("Apply account hold response: HTTP %d", resp.status_code)
-        return self._handle(resp, "Apply account hold")
-
-    # ------------------------------------------------------------------ #
-    # 3. Demand Deposit Account Enquiry
-    # ------------------------------------------------------------------ #
-    async def get_demand_deposit_account(
+    def get_demand_deposit_account(
         self,
         hub_customer_number: str,
-        sensitive_data:      Optional[str] = None,
+        sensitive_data: Optional[str] = None,
     ) -> dict[str, Any]:
+        # If caller didn't supply sensitive-data header, build a default from
+        # hubCustomerNumber (matches the curl shape).
+        sensitive = sensitive_data or json.dumps(
+            [{"key": hub_customer_number, "value": hub_customer_number}],
+            separators=(",", ":"),
+        )
 
-        headers = {
-            "Content-Type":                        "application/json",
-            "Accept":                              "application/json",
-            "X-HSBC-CB-Staff-User-Id":             config.DDA_STAFF_USER_ID,
-            "X-HSBC-Chnl-CountryCode":             config.DDA_COUNTRY_CODE,
-            "X-HSBC-Chnl-Group-Member":            config.DDA_GROUP_MEMBER,
-            "X-HSBC-Client-Id":                    config.DDA_CLIENT_ID,
-            "X-HSBC-Client-Secret":                config.DDA_CLIENT_SECRET,
-            "X-HSBC-Consumer-Id":                  config.DDA_CONSUMER_ID,
-            "X-HSBC-E2E-Trust-Token":              config.DDA_E2E_TRUST_TOKEN,
-            "X-HSBC-GBGF":                         config.DDA_GBGF,
-            "X-HSBC-Global-Channel-Id":            config.DDA_GLOBAL_CHANNEL_ID,
-            "X-HSBC-Request-Correlation-Id":       str(uuid.uuid4()),
-            "X-HSBC-Session-Correlation-Id":       str(uuid.uuid4()),
-            "X-HSBC-Source-System-Id":             config.DDA_SOURCE_SYSTEM_ID,
-            "X-HSBC-Src-UserAgent":               config.DDA_SRC_USER_AGENT,
-            "X-HSBC-Target-System-Environment-Id": config.DDA_TARGET_SYSTEM_ENV,
-            "X-HSBC-User-Id":                      config.DDA_USER_ID,
-            "X-HSBC-Workstation-Id":               config.DDA_WORKSTATION_ID,
-            "HSBC-CLIENT-IP":                      config.DDA_CLIENT_IP,
-            "User-Agent":                          config.DDA_SRC_USER_AGENT,
-        }
-        if sensitive_data:
-            headers["X-HSBC-Sensitive-Data"] = sensitive_data
+        return self._do(
+            method="GET",
+            url=config.HSBC_DEMAND_DEPOSIT_URL,
+            headers=self._headers_demand_deposit(sensitive),
+            params={"hubCustomerNumber": hub_customer_number},
+            op="demand_deposit",
+        )
 
-        logger.info("GET demand deposit account | hubCustomerNumber=%s", hub_customer_number)
+    # ------------------------------------------------------------------
+    # Core dispatch — every call goes through here
+    # ------------------------------------------------------------------
+
+    def _do(
+        self,
+        *,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        op: str,
+        params:    Optional[dict[str, Any]] = None,
+        json_body: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        # Log the URL with query string but never the trust token / secrets.
+        safe_url = f"{url}?{urlencode(params)}" if params else url
+        log.info("HSBC -> %s %s", method, safe_url)
+
         try:
-            resp = await self._http.get(
-                self._dda_url,
+            resp = self._session.request(
+                method=method,
+                url=url,
                 headers=headers,
-                params={"hubCustomerNumber": hub_customer_number},
+                params=params,
+                json=json_body,
+                timeout=(config.HTTP_CONNECT_TIMEOUT, config.HTTP_READ_TIMEOUT),
             )
-        except httpx.HTTPError as e:
-            logger.exception("Demand deposit account network error")
-            raise HSBCError(f"Demand deposit account network error: {type(e).__name__}") from e
+        except requests.exceptions.ProxyError as e:
+            log.error("HSBC %s proxy error: %s", op, e)
+            raise HSBCError(f"Proxy error reaching HSBC: {e}", status_code=502) from e
+        except requests.exceptions.ConnectTimeout as e:
+            log.error("HSBC %s connect timeout: %s", op, e)
+            raise HSBCError("Timed out connecting to HSBC", status_code=504) from e
+        except requests.exceptions.ReadTimeout as e:
+            log.error("HSBC %s read timeout: %s", op, e)
+            raise HSBCError("Timed out reading from HSBC", status_code=504) from e
+        except requests.exceptions.SSLError as e:
+            log.error("HSBC %s SSL error: %s", op, e)
+            raise HSBCError(f"SSL error: {e}", status_code=502) from e
+        except requests.exceptions.RequestException as e:
+            log.error("HSBC %s network error: %s", op, e)
+            raise HSBCError(f"Network error: {e}", status_code=502) from e
 
-        logger.info("Demand deposit account response: HTTP %d", resp.status_code)
-        return self._handle(resp, "Demand deposit account")
+        log.info("HSBC <- %s %s status=%d", method, op, resp.status_code)
 
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _handle(resp: httpx.Response, label: str) -> dict[str, Any]:
-        if resp.status_code not in (200, 201):
-            logger.error("%s failed: HTTP %d body=%s", label, resp.status_code, resp.text[:400])
-            raise HSBCError(f"{label} returned HTTP {resp.status_code}", upstream_status=resp.status_code)
+        # Try to parse JSON regardless of status — Hub returns structured error bodies.
         try:
-            return resp.json()
+            data = resp.json()
         except ValueError:
-            return {"raw": resp.text}
+            data = {"raw": resp.text}
+
+        if not resp.ok:
+            raise HSBCError(
+                f"HSBC {op} returned {resp.status_code}",
+                status_code=resp.status_code if 400 <= resp.status_code < 600 else 502,
+                upstream_status=resp.status_code,
+            )
+
+        return data
