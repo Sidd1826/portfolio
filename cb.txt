@@ -6,6 +6,60 @@ from pydantic import BaseModel, Field
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
+from typing import Optional, Union
+from pydantic import BaseModel, Field
+
+# Map each field to its BigQuery scalar type
+FIELD_TYPES = {
+    "XQCBA1": "STRING",
+    "OGBEAC": "STRING",
+    "OGBEA1": "STRING",
+    "OGBEA2": "STRING",
+    "OGBEA3": "STRING",
+    "OGBEA4": "STRING",
+    "OGT521": "STRING",
+    "OGTRNO": "STRING",
+    "OGTMZ1": "STRING",       # timestamp stored as string in your data
+    "OGCPDT": "INT64",        # 20260926
+    "OGCPTM": "INT64",        # 133101
+    "OGAVDT": "INT64",
+    "OGAVTM": "INT64",
+    "OGPYAM": "FLOAT64",
+    "OGPALE": "FLOAT64",
+    "OGPYCY": "STRING",
+    "OGNAR1": "STRING",
+    "OGNAR2": "STRING",
+    "OGNAR3": "STRING",
+    "OGNAR4": "STRING",
+}
+
+ALLOWED_FIELDS = set(FIELD_TYPES.keys())
+
+
+class SearchRequest(BaseModel):
+    XQCBA1: Optional[str] = None
+    OGBEAC: Optional[str] = None
+    OGBEA1: Optional[str] = None
+    OGBEA2: Optional[str] = None
+    OGBEA3: Optional[str] = None
+    OGBEA4: Optional[str] = None
+    OGT521: Optional[str] = None
+    OGTRNO: Optional[str] = None
+    OGTMZ1: Optional[str] = None
+    OGCPDT: Optional[int] = None      # int, not str
+    OGCPTM: Optional[int] = None
+    OGAVDT: Optional[int] = None
+    OGAVTM: Optional[int] = None
+    OGPYAM: Optional[float] = None
+    OGPALE: Optional[float] = None
+    OGPYCY: Optional[str] = None
+    OGNAR1: Optional[str] = None
+    OGNAR2: Optional[str] = None
+    OGNAR3: Optional[str] = None
+    OGNAR4: Optional[str] = None
+    limit: Optional[int] = Field(100, ge=1, le=10000)
+
+
 # ---------- Config ----------
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "serviceaccount.json")
 KMS_KEY = os.getenv("KMS_KEY")
