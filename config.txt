@@ -1,43 +1,159 @@
 """
-config.py - URLs, credentials, proxy.
-HSBC headers are defined directly in each client function (not via env).
+config.py — Central config.
+
+On Cloud Run: secrets are pulled from GCP Secret Manager at startup.
+Locally: values are loaded from .env via python-dotenv.
+
+Secret Manager is only used when GOOGLE_CLOUD_PROJECT is set (i.e. on GCP).
+Locally it falls back to .env / os.environ as before — no GCP credentials needed.
 """
+from __future__ import annotations
+
 import os
 
-# ---- UPI ----
-UPI_BASE_URL    = os.getenv("UPI_BASE_URL",    "https://upi-uat-mob.hsbc.co.in")
-UPI_LOGIN_PATH  = os.getenv("UPI_LOGIN_PATH",  "/sha/api/auth/login")
-UPI_SECURE_PATH = os.getenv("UPI_SECURE_PATH", "/mha/secure/sha/check")
-UPI_USERNAME    = os.getenv("UPI_USERNAME",    "hsbc")
-UPI_PASSWORD    = os.getenv("UPI_PASSWORD",    "hsbcuat2026")
-UPI_AES_KEY_HEX = os.getenv("UPI_AES_KEY_HEX","")
+# Load .env for local dev (no-op on Cloud Run)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
 
-# ---- HSBC Hub API URLs ----
-TXN_HISTORY_URL = os.getenv(
-    "TXN_HISTORY_URL",
-    "https://cbil-in-hbap-hub-dd-trans-history-enq-3.hsbc-cbsa-hub-cert.svc.apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc"
-    "/api/v3/account/demand-deposit-transaction-history",
+
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    return float(raw) if raw else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    return int(raw) if raw else default
+
+
+# ---------------------------------------------------------------------------
+# Secret Manager — only runs on GCP (when GOOGLE_CLOUD_PROJECT is set).
+# Pulls each secret by name and injects into os.environ so the rest of
+# config.py can read them with plain os.getenv() calls — no other file changes.
+# ---------------------------------------------------------------------------
+
+def _load_secrets_from_gcp() -> None:
+    """Pull all secrets from Secret Manager and set them into os.environ."""
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+    if not project_id:
+        # Not on GCP — use .env / os.environ as-is
+        return
+
+    try:
+        from google.cloud import secretmanager
+    except ImportError:
+        raise RuntimeError(
+            "google-cloud-secret-manager is not installed. "
+            "Run: pip install google-cloud-secret-manager"
+        )
+
+    client = secretmanager.SecretManagerServiceClient()
+
+    # Map: env var name -> Secret Manager secret name
+    # The secret name must match exactly what you created in Secret Manager.
+    secrets_to_load = {
+        "UPI_USERNAME":                           "UPI_USERNAME",
+        "UPI_PASSWORD":                           "UPI_PASSWORD",
+        "UPI_AES_KEY_HEX":                        "UPI_AES_KEY_HEX",
+        "HSBC_TRUST_TOKEN_TRANSACTION_HISTORY":   "HSBC_TRUST_TOKEN_TRANSACTION_HISTORY",
+        "HSBC_TRUST_TOKEN_APPLY_HOLD":            "HSBC_TRUST_TOKEN_APPLY_HOLD",
+        "HSBC_TRUST_TOKEN_DEMAND_DEPOSIT":        "HSBC_TRUST_TOKEN_DEMAND_DEPOSIT",
+    }
+
+    for env_var, secret_name in secrets_to_load.items():
+        # Skip if already set (allows override via --set-env-vars if ever needed)
+        if os.environ.get(env_var):
+            continue
+        try:
+            secret_path = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+            response = client.access_secret_version(request={"name": secret_path})
+            os.environ[env_var] = response.payload.data.decode("utf-8").strip()
+        except Exception as e:
+            # Raise loudly — a missing secret should crash startup, not silently
+            # run with an empty value which causes confusing downstream errors.
+            raise RuntimeError(
+                f"Failed to load secret '{secret_name}' from Secret Manager: {e}"
+            ) from e
+
+
+# Pull secrets before reading any config values below
+_load_secrets_from_gcp()
+
+
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+
+HTTP_CONNECT_TIMEOUT: float = _env_float("HTTP_CONNECT_TIMEOUT", 10.0)
+HTTP_READ_TIMEOUT:    float = _env_float("HTTP_READ_TIMEOUT",    30.0)
+HTTP_MAX_RETRIES:     int   = _env_int("HTTP_MAX_RETRIES", 2)
+
+
+# ---------------------------------------------------------------------------
+# UPI
+# ---------------------------------------------------------------------------
+
+UPI_BASE_URL:    str = _env("UPI_BASE_URL",    "https://upi-uat-mob.hsbc.co.in")
+UPI_LOGIN_PATH:  str = _env("UPI_LOGIN_PATH",  "/sha/api/auth/login")
+UPI_SECURE_PATH: str = _env("UPI_SECURE_PATH", "/mha/secure/sha/check")
+
+UPI_USERNAME:    str = _env("UPI_USERNAME", "")
+UPI_PASSWORD:    str = _env("UPI_PASSWORD", "")
+UPI_AES_KEY_HEX: str = _env("UPI_AES_KEY_HEX", "")
+
+TOKEN_REFRESH_LEEWAY_SEC: int = _env_int("TOKEN_REFRESH_LEEWAY_SEC", 60)
+TOKEN_DEFAULT_TTL_SEC:    int = _env_int("TOKEN_DEFAULT_TTL_SEC", 900)
+
+
+# ---------------------------------------------------------------------------
+# HSBC Hub endpoints (non-sensitive — set as plain env vars on Cloud Run)
+# ---------------------------------------------------------------------------
+
+HSBC_TRANSACTION_HISTORY_URL: str = _env(
+    "HSBC_TRANSACTION_HISTORY_URL",
+    "https://cbil-in-hbap-hub-dd-trans-history-enq-3.hsbc-cbsa-hub-cert.svc."
+    "apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc/api/v3/account/demand-deposit-transaction-history",
 )
-ACCT_HOLD_URL = os.getenv(
-    "ACCT_HOLD_URL",
-    "https://cbil-in-hbap-hub-add-acct-hld-pst-2.hsbc-cbsa-hub-cert.svc.aplapg02.shp.ape1.pre-prod.aws.cloud.hsbc"
-    "/api/accounts/apply-account-holds",
-)
-DDA_URL = os.getenv(
-    "DDA_URL",
-    "https://cbil-in-hbap-hub-demand-deposit-acct-enq-5.hsbc-cbsa-hub-cert.svc.aplapg02.shp.ape1.pre-prod.aws.cloud.hsbc"
-    "/api/v5/accounts/demand-deposit-account",
+
+HSBC_APPLY_HOLD_URL: str = _env(
+    "HSBC_APPLY_HOLD_URL",
+    "https://cbil-in-hbap-hub-add-acct-hld-pst-2.hsbc-cbsa-hub-cert.svc."
+    "apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc/api/accounts/apply-account-holds",
 )
 
-# ---- Proxy ----
-# Trailing slash stripped automatically so http://proxy.test/ also works.
-_raw_proxy = os.getenv("PROXY_URL", "")
-PROXY_URL  = _raw_proxy.rstrip("/") if _raw_proxy else ""
+HSBC_DEMAND_DEPOSIT_URL: str = _env(
+    "HSBC_DEMAND_DEPOSIT_URL",
+    "https://cbil-in-hbap-hub-demand-deposit-acct-enq-5.hsbc-cbsa-hub-cert.svc."
+    "apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc/api/v5/accounts/demand-deposit-account",
+)
 
-# ---- HTTP timeouts ----
-HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
-HTTP_READ_TIMEOUT    = float(os.getenv("HTTP_READ_TIMEOUT",    "60"))
 
-# ---- UPI token cache ----
-TOKEN_REFRESH_LEEWAY = int(os.getenv("TOKEN_REFRESH_LEEWAY_SEC", "60"))
-TOKEN_DEFAULT_TTL    = int(os.getenv("TOKEN_DEFAULT_TTL_SEC",    "900"))
+# ---------------------------------------------------------------------------
+# HSBC E2E Trust Tokens (pulled from Secret Manager above)
+# ---------------------------------------------------------------------------
+
+HSBC_TRUST_TOKEN_TRANSACTION_HISTORY: str = _env("HSBC_TRUST_TOKEN_TRANSACTION_HISTORY", "")
+HSBC_TRUST_TOKEN_APPLY_HOLD:          str = _env("HSBC_TRUST_TOKEN_APPLY_HOLD", "")
+HSBC_TRUST_TOKEN_DEMAND_DEPOSIT:      str = _env("HSBC_TRUST_TOKEN_DEMAND_DEPOSIT", "")
+
+
+# ---------------------------------------------------------------------------
+# Static correlation IDs
+# ---------------------------------------------------------------------------
+
+HSBC_REQUEST_CORRELATION_ID: str = _env(
+    "HSBC_REQUEST_CORRELATION_ID",
+    "550e8400-e29b-41d4-a716-446655440000",
+)
+
+HSBC_SESSION_CORRELATION_ID: str = _env(
+    "HSBC_SESSION_CORRELATION_ID",
+    "session-12345-abc",
+)
