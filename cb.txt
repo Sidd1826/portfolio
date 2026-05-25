@@ -1,0 +1,69 @@
+import os
+from fastapi import FastAPI, HTTPException
+from google.cloud import bigquery
+from google.oauth2 import service_account
+
+# Path to your service account JSON file
+SERVICE_ACCOUNT_FILE = "path/to/your-service-account.json"
+PROJECT_ID = "your-gcp-project-id"
+DATASET_ID = "your_dataset"
+TABLE_ID = "your_table"
+
+# Create credentials and client once at startup
+credentials = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE,
+    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+)
+client = bigquery.Client(credentials=credentials, project=PROJECT_ID)
+
+app = FastAPI()
+
+
+@app.get("/schema")
+def get_schema():
+    """Get table schema - shows what columns/data exist."""
+    try:
+        table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+        table = client.get_table(table_ref)
+        return {
+            "table": table_ref,
+            "num_rows": table.num_rows,
+            "size_mb": round(table.num_bytes / (1024 * 1024), 2),
+            "schema": [
+                {"name": f.name, "type": f.field_type, "mode": f.mode}
+                for f in table.schema
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/preview")
+def preview_data(limit: int = 10):
+    """Preview rows from the table."""
+    try:
+        query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}` LIMIT {limit}"
+        rows = client.query(query).result()
+        return {"rows": [dict(row) for row in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/query")
+def run_query(sql: str):
+    """Run a custom SQL query."""
+    try:
+        rows = client.query(sql).result()
+        return {"rows": [dict(row) for row in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tables")
+def list_tables():
+    """List all tables in the dataset."""
+    try:
+        tables = client.list_tables(f"{PROJECT_ID}.{DATASET_ID}")
+        return {"tables": [t.table_id for t in tables]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
