@@ -6,10 +6,19 @@ from pydantic import BaseModel, Field
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-from typing import Optional, Union
-from pydantic import BaseModel, Field
+# ---------- Config ----------
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "serviceaccount.json")
+KMS_KEY = os.getenv("KMS_KEY")  # Optional, leave unset if not using CMEK
 
-# Map each field to its BigQuery scalar type
+PROJECT_ID = os.getenv("PROJECT_ID", "your-gcp-project-id")
+DATASET_ID = os.getenv("DATASET_ID", "your_dataset")
+TABLE_ID = os.getenv("TABLE_ID", "your_table")
+
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------- Field type mapping ----------
 FIELD_TYPES = {
     "XQCBA1": "STRING",
     "OGBEAC": "STRING",
@@ -19,9 +28,9 @@ FIELD_TYPES = {
     "OGBEA4": "STRING",
     "OGT521": "STRING",
     "OGTRNO": "STRING",
-    "OGTMZ1": "STRING",       # timestamp stored as string in your data
-    "OGCPDT": "INT64",        # 20260926
-    "OGCPTM": "INT64",        # 133101
+    "OGTMZ1": "STRING",
+    "OGCPDT": "INT64",
+    "OGCPTM": "INT64",
     "OGAVDT": "INT64",
     "OGAVTM": "INT64",
     "OGPYAM": "FLOAT64",
@@ -35,56 +44,11 @@ FIELD_TYPES = {
 
 ALLOWED_FIELDS = set(FIELD_TYPES.keys())
 
-
-class SearchRequest(BaseModel):
-    XQCBA1: Optional[str] = None
-    OGBEAC: Optional[str] = None
-    OGBEA1: Optional[str] = None
-    OGBEA2: Optional[str] = None
-    OGBEA3: Optional[str] = None
-    OGBEA4: Optional[str] = None
-    OGT521: Optional[str] = None
-    OGTRNO: Optional[str] = None
-    OGTMZ1: Optional[str] = None
-    OGCPDT: Optional[int] = None      # int, not str
-    OGCPTM: Optional[int] = None
-    OGAVDT: Optional[int] = None
-    OGAVTM: Optional[int] = None
-    OGPYAM: Optional[float] = None
-    OGPALE: Optional[float] = None
-    OGPYCY: Optional[str] = None
-    OGNAR1: Optional[str] = None
-    OGNAR2: Optional[str] = None
-    OGNAR3: Optional[str] = None
-    OGNAR4: Optional[str] = None
-    limit: Optional[int] = Field(100, ge=1, le=10000)
-
-
-# ---------- Config ----------
-SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "serviceaccount.json")
-KMS_KEY = os.getenv("KMS_KEY")
-
-PROJECT_ID = os.getenv("PROJECT_ID", "your-gcp-project-id")
-DATASET_ID = os.getenv("DATASET_ID", "your_dataset")
-TABLE_ID = os.getenv("TABLE_ID", "your_table")
-
-# Whitelist of allowed filter fields (prevents SQL injection via column names)
-ALLOWED_FIELDS = {
-    "XQCBA1", "OGBEAC", "OGBEA1", "OGBEA2", "OGBEA3", "OGBEA4",
-    "OGT521", "OGTRNO", "OGTMZ1", "OGCPDT", "OGCPTM",
-    "OGAVDT", "OGAVTM", "OGPYAM", "OGPALE", "OGPYCY",
-    "OGNAR1", "OGNAR2", "OGNAR3", "OGNAR4",
-}
-
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # ---------- FastAPI ----------
 app = FastAPI(title="BigQuery Search API")
 
 
-# Request body model - all fields optional, pass any combination
+# ---------- Request Model ----------
 class SearchRequest(BaseModel):
     XQCBA1: Optional[str] = Field(None, description="Correspondent Bank/Branch Name and Address")
     OGBEAC: Optional[str] = Field(None, description="Beneficiary A/C No")
@@ -95,10 +59,10 @@ class SearchRequest(BaseModel):
     OGT521: Optional[str] = Field(None, description="Tag52 Ordering Institution Line 1")
     OGTRNO: Optional[str] = Field(None, description="Transaction Reference No")
     OGTMZ1: Optional[str] = Field(None, description="Time Stamp")
-    OGCPDT: Optional[str] = Field(None, description="Capture Date")
-    OGCPTM: Optional[str] = Field(None, description="Capture Time")
-    OGAVDT: Optional[str] = Field(None, description="Approval/Verification Date")
-    OGAVTM: Optional[str] = Field(None, description="Approval/Verification Time")
+    OGCPDT: Optional[int] = Field(None, description="Capture Date (e.g. 20260926)")
+    OGCPTM: Optional[int] = Field(None, description="Capture Time (e.g. 133101)")
+    OGAVDT: Optional[int] = Field(None, description="Approval/Verification Date (e.g. 20260926)")
+    OGAVTM: Optional[int] = Field(None, description="Approval/Verification Time (e.g. 133101)")
     OGPYAM: Optional[float] = Field(None, description="Payment Amount")
     OGPALE: Optional[float] = Field(None, description="Lcy Payment Amount")
     OGPYCY: Optional[str] = Field(None, description="Payment Currency")
@@ -106,47 +70,45 @@ class SearchRequest(BaseModel):
     OGNAR2: Optional[str] = Field(None, description="Narrative 2")
     OGNAR3: Optional[str] = Field(None, description="Narrative 3")
     OGNAR4: Optional[str] = Field(None, description="Narrative 4")
-
-    # Optional: limit number of rows returned
-    limit: Optional[int] = Field(100, ge=1, le=10000)
+    limit: Optional[int] = Field(100, ge=1, le=10000, description="Max rows to return")
 
 
+# ---------- BQ Client ----------
 def get_bq_client() -> bigquery.Client:
     credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
-    return bigquery.Client(credentials=credentials, project=credentials.project_id)
+    return bigquery.Client(credentials=credentials, project=PROJECT_ID)
 
 
+# ---------- Core Query Function ----------
 def run_search(filters: dict, limit: int) -> list[dict]:
-    """Build a parameterized query from the supplied filters and execute it."""
     try:
         client = get_bq_client()
 
-        # Build WHERE clause with parameterized queries (safe from SQL injection)
         where_clauses = []
         query_params = []
 
         for field, value in filters.items():
             if field not in ALLOWED_FIELDS:
-                # Skip unknown fields defensively
+                logger.warning("Skipping unknown field: %s", field)
                 continue
 
-            # Pick the BigQuery scalar type based on Python type
-            if isinstance(value, (int, float)):
-                param_type = "FLOAT64" if isinstance(value, float) else "INT64"
-            else:
-                param_type = "STRING"
-
+            param_type = FIELD_TYPES[field]
             where_clauses.append(f"`{field}` = @{field}")
-            query_params.append(bigquery.ScalarQueryParameter(field, param_type, value))
+            query_params.append(
+                bigquery.ScalarQueryParameter(field, param_type, value)
+            )
+
+        query_params.append(
+            bigquery.ScalarQueryParameter("row_limit", "INT64", limit)
+        )
 
         table_ref = f"`{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`"
         query = f"SELECT * FROM {table_ref}"
         if where_clauses:
             query += " WHERE " + " AND ".join(where_clauses)
         query += " LIMIT @row_limit"
-        query_params.append(bigquery.ScalarQueryParameter("row_limit", "INT64", limit))
 
-        # Job config: parameters + optional KMS encryption
+        # Job config
         job_config_kwargs = {"query_parameters": query_params}
         if KMS_KEY:
             job_config_kwargs["destination_encryption_configuration"] = (
@@ -154,7 +116,7 @@ def run_search(filters: dict, limit: int) -> list[dict]:
             )
         job_config = bigquery.QueryJobConfig(**job_config_kwargs)
 
-        logger.info("Running query: %s | params: %s", query, filters)
+        logger.info("Executing query: %s | filters: %s", query, filters)
 
         job = client.query(query, job_config=job_config)
         results = [dict(row) for row in job.result()]
@@ -162,22 +124,29 @@ def run_search(filters: dict, limit: int) -> list[dict]:
         logger.info("Rows fetched: %d", len(results))
         return results
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception("BigQuery search failed")
+        logger.exception("BigQuery query failed")
         raise HTTPException(
             status_code=500,
             detail=f"Error occurred while fetching data from BigQuery: {str(e)}",
         )
 
 
+# ---------- Routes ----------
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "project": PROJECT_ID,
+        "dataset": DATASET_ID,
+        "table": TABLE_ID,
+    }
 
 
 @app.post("/search")
 def search(req: SearchRequest):
-    # Extract only the fields the user actually provided (non-None), excluding `limit`
     filters = {
         k: v for k, v in req.model_dump(exclude_none=True).items()
         if k != "limit"
@@ -186,7 +155,7 @@ def search(req: SearchRequest):
     if not filters:
         raise HTTPException(
             status_code=400,
-            detail="Provide at least one field to search on.",
+            detail="Provide at least one field to filter on.",
         )
 
     rows = run_search(filters, req.limit or 100)
