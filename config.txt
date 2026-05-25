@@ -1,9 +1,12 @@
 """
-config.py — Central config. Everything comes from env vars so Cloud Run
-revisions can set them via Secret Manager / --set-env-vars.
+config.py — Central config.
 
-Locally, values are loaded from a .env file via python-dotenv.
-On Cloud Run, os.environ is already populated — dotenv is a no-op.
+On Cloud Run: secrets are pulled from GCP Secret Manager at startup,
+              BigQuery uses Application Default Credentials (ADC).
+Locally:      values are loaded from .env via python-dotenv.
+
+Secret Manager is only contacted when GOOGLE_CLOUD_PROJECT is set (i.e. on
+GCP). Locally it falls back to .env / os.environ — no GCP credentials needed.
 """
 from __future__ import annotations
 
@@ -28,6 +31,50 @@ def _env_float(name: str, default: float) -> float:
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     return int(raw) if raw else default
+
+
+# ---------------------------------------------------------------------------
+# Secret Manager — only runs on GCP (when GOOGLE_CLOUD_PROJECT is set).
+# ---------------------------------------------------------------------------
+
+def _load_secrets_from_gcp() -> None:
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+    if not project_id:
+        return
+
+    try:
+        from google.cloud import secretmanager
+    except ImportError:
+        raise RuntimeError(
+            "google-cloud-secret-manager is not installed. "
+            "Run: pip install google-cloud-secret-manager"
+        )
+
+    client = secretmanager.SecretManagerServiceClient()
+
+    secrets_to_load = {
+        "UPI_USERNAME":                           "UPI_USERNAME",
+        "UPI_PASSWORD":                           "UPI_PASSWORD",
+        "UPI_AES_KEY_HEX":                        "UPI_AES_KEY_HEX",
+        "HSBC_TRUST_TOKEN_TRANSACTION_HISTORY":   "HSBC_TRUST_TOKEN_TRANSACTION_HISTORY",
+        "HSBC_TRUST_TOKEN_APPLY_HOLD":            "HSBC_TRUST_TOKEN_APPLY_HOLD",
+        "HSBC_TRUST_TOKEN_DEMAND_DEPOSIT":        "HSBC_TRUST_TOKEN_DEMAND_DEPOSIT",
+    }
+
+    for env_var, secret_name in secrets_to_load.items():
+        if os.environ.get(env_var):
+            continue
+        try:
+            secret_path = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+            response = client.access_secret_version(request={"name": secret_path})
+            os.environ[env_var] = response.payload.data.decode("utf-8").strip()
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load secret '{secret_name}' from Secret Manager: {e}"
+            ) from e
+
+
+_load_secrets_from_gcp()
 
 
 # ---------------------------------------------------------------------------
@@ -77,19 +124,9 @@ HSBC_DEMAND_DEPOSIT_URL: str = _env(
     "apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc/api/v5/accounts/demand-deposit-account",
 )
 
-
-# ---------------------------------------------------------------------------
-# HSBC E2E Trust Tokens — one per API
-# ---------------------------------------------------------------------------
-
 HSBC_TRUST_TOKEN_TRANSACTION_HISTORY: str = _env("HSBC_TRUST_TOKEN_TRANSACTION_HISTORY", "")
 HSBC_TRUST_TOKEN_APPLY_HOLD:          str = _env("HSBC_TRUST_TOKEN_APPLY_HOLD", "")
 HSBC_TRUST_TOKEN_DEMAND_DEPOSIT:      str = _env("HSBC_TRUST_TOKEN_DEMAND_DEPOSIT", "")
-
-
-# ---------------------------------------------------------------------------
-# Static correlation IDs
-# ---------------------------------------------------------------------------
 
 HSBC_REQUEST_CORRELATION_ID: str = _env(
     "HSBC_REQUEST_CORRELATION_ID",
@@ -100,3 +137,15 @@ HSBC_SESSION_CORRELATION_ID: str = _env(
     "HSBC_SESSION_CORRELATION_ID",
     "session-12345-abc",
 )
+
+
+# ---------------------------------------------------------------------------
+# BigQuery — auth via ADC, identifiers from env
+# ---------------------------------------------------------------------------
+
+BQ_PROJECT_ID: str = _env("BQ_PROJECT_ID", "")
+BQ_DATASET_ID: str = _env("BQ_DATASET_ID", "")
+BQ_TABLE_ID:   str = _env("BQ_TABLE_ID",   "")
+
+# Optional CMEK — leave empty unless your dataset requires it.
+BQ_KMS_KEY:    str = _env("BQ_KMS_KEY", "")
