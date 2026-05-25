@@ -1,53 +1,115 @@
 import os
 import logging
+from typing import Optional
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
 # ---------- Config ----------
-# Path to service account file - can be absolute or relative to where you run the app
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "serviceaccount.json")
+KMS_KEY = os.getenv("KMS_KEY")
 
-# Optional: KMS key for customer-managed encryption (CMEK)
-# Format: projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY
-KMS_KEY = os.getenv("KMS_KEY")  # leave unset if not using CMEK
+PROJECT_ID = os.getenv("PROJECT_ID", "your-gcp-project-id")
+DATASET_ID = os.getenv("DATASET_ID", "your_dataset")
+TABLE_ID = os.getenv("TABLE_ID", "your_table")
+
+# Whitelist of allowed filter fields (prevents SQL injection via column names)
+ALLOWED_FIELDS = {
+    "XQCBA1", "OGBEAC", "OGBEA1", "OGBEA2", "OGBEA3", "OGBEA4",
+    "OGT521", "OGTRNO", "OGTMZ1", "OGCPDT", "OGCPTM",
+    "OGAVDT", "OGAVTM", "OGPYAM", "OGPALE", "OGPYCY",
+    "OGNAR1", "OGNAR2", "OGNAR3", "OGNAR4",
+}
 
 # ---------- Logging ----------
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="BigQuery API")
+app = FastAPI(title="BigQuery Search API")
 
 
-class QueryRequest(BaseModel):
-    query: str
+# Request body model - all fields optional, pass any combination
+class SearchRequest(BaseModel):
+    XQCBA1: Optional[str] = Field(None, description="Correspondent Bank/Branch Name and Address")
+    OGBEAC: Optional[str] = Field(None, description="Beneficiary A/C No")
+    OGBEA1: Optional[str] = Field(None, description="Beneficiary Name and Address Line 1")
+    OGBEA2: Optional[str] = Field(None, description="Beneficiary Name and Address Line 2")
+    OGBEA3: Optional[str] = Field(None, description="Beneficiary Name and Address Line 3")
+    OGBEA4: Optional[str] = Field(None, description="Beneficiary Name and Address Line 4")
+    OGT521: Optional[str] = Field(None, description="Tag52 Ordering Institution Line 1")
+    OGTRNO: Optional[str] = Field(None, description="Transaction Reference No")
+    OGTMZ1: Optional[str] = Field(None, description="Time Stamp")
+    OGCPDT: Optional[str] = Field(None, description="Capture Date")
+    OGCPTM: Optional[str] = Field(None, description="Capture Time")
+    OGAVDT: Optional[str] = Field(None, description="Approval/Verification Date")
+    OGAVTM: Optional[str] = Field(None, description="Approval/Verification Time")
+    OGPYAM: Optional[float] = Field(None, description="Payment Amount")
+    OGPALE: Optional[float] = Field(None, description="Lcy Payment Amount")
+    OGPYCY: Optional[str] = Field(None, description="Payment Currency")
+    OGNAR1: Optional[str] = Field(None, description="Narrative 1")
+    OGNAR2: Optional[str] = Field(None, description="Narrative 2")
+    OGNAR3: Optional[str] = Field(None, description="Narrative 3")
+    OGNAR4: Optional[str] = Field(None, description="Narrative 4")
+
+    # Optional: limit number of rows returned
+    limit: Optional[int] = Field(100, ge=1, le=10000)
 
 
-def gcp_kms(creds_path: str, query: str) -> list[dict]:
+def get_bq_client() -> bigquery.Client:
+    credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
+    return bigquery.Client(credentials=credentials, project=credentials.project_id)
+
+
+def run_search(filters: dict, limit: int) -> list[dict]:
+    """Build a parameterized query from the supplied filters and execute it."""
     try:
-        credentials = service_account.Credentials.from_service_account_file(creds_path)
-        client = bigquery.Client(
-            credentials=credentials,
-            project=credentials.project_id,
-        )
+        client = get_bq_client()
 
-        job_config = None
+        # Build WHERE clause with parameterized queries (safe from SQL injection)
+        where_clauses = []
+        query_params = []
+
+        for field, value in filters.items():
+            if field not in ALLOWED_FIELDS:
+                # Skip unknown fields defensively
+                continue
+
+            # Pick the BigQuery scalar type based on Python type
+            if isinstance(value, (int, float)):
+                param_type = "FLOAT64" if isinstance(value, float) else "INT64"
+            else:
+                param_type = "STRING"
+
+            where_clauses.append(f"`{field}` = @{field}")
+            query_params.append(bigquery.ScalarQueryParameter(field, param_type, value))
+
+        table_ref = f"`{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`"
+        query = f"SELECT * FROM {table_ref}"
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+        query += " LIMIT @row_limit"
+        query_params.append(bigquery.ScalarQueryParameter("row_limit", "INT64", limit))
+
+        # Job config: parameters + optional KMS encryption
+        job_config_kwargs = {"query_parameters": query_params}
         if KMS_KEY:
-            enc = bigquery.EncryptionConfiguration(kms_key_name=KMS_KEY)
-            job_config = bigquery.QueryJobConfig(
-                destination_encryption_configuration=enc
+            job_config_kwargs["destination_encryption_configuration"] = (
+                bigquery.EncryptionConfiguration(kms_key_name=KMS_KEY)
             )
+        job_config = bigquery.QueryJobConfig(**job_config_kwargs)
+
+        logger.info("Running query: %s | params: %s", query, filters)
 
         job = client.query(query, job_config=job_config)
         results = [dict(row) for row in job.result()]
 
-        logger.debug("Query executed successfully. Rows fetched: %d", len(results))
+        logger.info("Rows fetched: %d", len(results))
         return results
 
     except Exception as e:
-        logger.exception("BigQuery query failed")
+        logger.exception("BigQuery search failed")
         raise HTTPException(
             status_code=500,
             detail=f"Error occurred while fetching data from BigQuery: {str(e)}",
@@ -56,10 +118,26 @@ def gcp_kms(creds_path: str, query: str) -> list[dict]:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "creds_file": SERVICE_ACCOUNT_FILE}
+    return {"status": "ok"}
 
 
-@app.post("/query")
-def run_query(req: QueryRequest):
-    results = gcp_kms(SERVICE_ACCOUNT_FILE, req.query)
-    return {"row_count": len(results), "rows": results}
+@app.post("/search")
+def search(req: SearchRequest):
+    # Extract only the fields the user actually provided (non-None), excluding `limit`
+    filters = {
+        k: v for k, v in req.model_dump(exclude_none=True).items()
+        if k != "limit"
+    }
+
+    if not filters:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide at least one field to search on.",
+        )
+
+    rows = run_search(filters, req.limit or 100)
+    return {
+        "filters_used": filters,
+        "row_count": len(rows),
+        "rows": rows,
+    }
