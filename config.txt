@@ -140,12 +140,17 @@ HSBC_SESSION_CORRELATION_ID: str = _env(
 
 
 # ---------------------------------------------------------------------------
-# BigQuery — auth via ADC, identifiers from env
+# BigQuery — auth via service account JSON file, identifiers from env
 # ---------------------------------------------------------------------------
 
 BQ_PROJECT_ID: str = _env("BQ_PROJECT_ID", "")
 BQ_DATASET_ID: str = _env("BQ_DATASET_ID", "")
 BQ_TABLE_ID:   str = _env("BQ_TABLE_ID",   "")
 
+# Path to the service account JSON.
+# Local dev:  /full/path/to/serviceaccount.json
+# Cloud Run:  /secrets/sa.json  (mounted via --set-secrets from Secret Manager)
+BQ_SERVICE_ACCOUNT_FILE: str = _env("BQ_SERVICE_ACCOUNT_FILE", "")
+
 # Optional CMEK — leave empty unless your dataset requires it.
-BQ_KMS_KEY:    str = _env("BQ_KMS_KEY", "")
+BQ_KMS_KEY: str = _env("BQ_KMS_KEY", "")
