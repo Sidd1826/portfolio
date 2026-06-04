@@ -8,6 +8,8 @@ Routes
   POST /api/v1/accounts/apply-hold   (body forwarded as-is)
   GET  /api/v1/accounts/demand-deposit?hubCustomerNumber=... + body sensitiveData
   POST /api/v1/search                (BigQuery filtered search)
+  GET  /api/v1/search/by-reference?transactionRef=...   (use case 1)
+  POST /api/v1/search/reconcile      (use case 2: cumulative reconcile)
 
 Run locally:
   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -19,7 +21,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import httpx
 from fastapi import FastAPI, Body, HTTPException, Query, Request
@@ -27,7 +29,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import config
-from bq_client import BigQueryClient, BigQueryError, FIELD_TYPES
+from bq_client import (
+    AMOUNT_FIELDS,
+    BigQueryClient,
+    BigQueryError,
+    DEFAULT_ORDER_FIELDS,
+    FIELD_TYPES,
+)
 from hsbc_client import HSBCError, HSBCHubClient
 from logger import get_logger
 from upi import AESCipher, CryptoError, UPIClient, UPIError
@@ -290,6 +298,134 @@ async def search(request: Request, req: SearchRequest):
         raise HTTPException(e.status_code, detail={
             "requestId": req_id, "error": "bigquery_error", "message": str(e),
         })
+
+
+# ---------------------------------------------------------------------------
+# Use case 1 — Search a particular transaction by reference number (OGTRNO)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/search/by-reference", tags=["Search"])
+async def search_by_reference(
+    request:         Request,
+    transaction_ref: str = Query(..., alias="transactionRef",
+                                  description="Transaction Reference No (OGTRNO)"),
+    limit:           int = Query(50, ge=1, le=1000,
+                                 description="Max matching rows to return"),
+):
+    req_id = str(uuid.uuid4())
+    log.info("[%s] GET /search/by-reference transactionRef=%s", req_id, transaction_ref)
+
+    bq: BigQueryClient = request.app.state.bq
+    try:
+        rows = await asyncio.to_thread(bq.get_by_reference, transaction_ref, limit=limit)
+    except BigQueryError as e:
+        log.error("[%s] %s", req_id, e)
+        raise HTTPException(e.status_code, detail={
+            "requestId": req_id, "error": "bigquery_error", "message": str(e),
+        })
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail={"requestId": req_id, "error": "not_found",
+                    "message": f"No transaction found for reference {transaction_ref!r}"},
+        )
+
+    return {
+        "requestId":       req_id,
+        "transactionRef":  transaction_ref,
+        "row_count":       len(rows),
+        "rows":            rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Use case 2 — Reconcile transactions until a target amount is reached
+#
+# Starting from the anchor transaction (OGTRNO == transactionRef), walk
+# transactions in chronological order and return every row until the running
+# total of the chosen amount field reaches (>=) targetAmount. The row that
+# crosses the threshold is included.
+# ---------------------------------------------------------------------------
+
+class ReconcileRequest(BaseModel):
+    transactionRef: str = Field(
+        ..., description="Anchor transaction reference (OGTRNO) to start from."
+    )
+    targetAmount: float = Field(
+        ..., gt=0, description="Reconcile until cumulative amount >= this value."
+    )
+    amountField: Literal["OGPYAM", "OGPALE"] = Field(
+        "OGPYAM",
+        description="Which amount column to accumulate: OGPYAM (payment amount) "
+                    "or OGPALE (local-currency amount).",
+    )
+    orderBy: list[str] = Field(
+        list(DEFAULT_ORDER_FIELDS),
+        description="Chronological ordering fields. Default: capture date then time "
+                    "(OGCPDT, OGCPTM).",
+    )
+    scopeFilters: Optional[dict[str, Any]] = Field(
+        None,
+        description="Optional equality filters (whitelisted fields) to scope the "
+                    "walk, e.g. {'OGBEAC': '<beneficiary acct>', 'OGPYCY': 'INR'}. "
+                    "Recommended: scope to one account and pin a single currency.",
+        examples=[{"OGBEAC": "INHSBC500021738001", "OGPYCY": "INR"}],
+    )
+    includeAnchor: bool = Field(
+        True, description="Include the anchor transaction itself in the walk/total."
+    )
+    limit: int = Field(
+        10000, ge=1, le=100000, description="Hard cap on rows returned."
+    )
+
+
+@app.post("/api/v1/search/reconcile", tags=["Search"])
+async def reconcile(request: Request, req: ReconcileRequest):
+    req_id = str(uuid.uuid4())
+
+    # Validate field names up front for clean 400s (bq_client also defends).
+    if req.amountField not in AMOUNT_FIELDS:
+        raise HTTPException(400, detail={
+            "requestId": req_id, "error": "bad_request",
+            "message": f"amountField must be one of {sorted(AMOUNT_FIELDS)}",
+        })
+    bad_order = [f for f in req.orderBy if f not in FIELD_TYPES]
+    if bad_order:
+        raise HTTPException(400, detail={
+            "requestId": req_id, "error": "bad_request",
+            "message": f"Unknown orderBy field(s): {bad_order}",
+        })
+    scope = req.scopeFilters or {}
+    bad_scope = [f for f in scope if f not in FIELD_TYPES]
+    if bad_scope:
+        raise HTTPException(400, detail={
+            "requestId": req_id, "error": "bad_request",
+            "message": f"Unknown scopeFilters field(s): {bad_scope}",
+        })
+
+    log.info("[%s] POST /search/reconcile ref=%s target=%s amountField=%s scope=%s",
+             req_id, req.transactionRef, req.targetAmount, req.amountField, list(scope.keys()))
+
+    bq: BigQueryClient = request.app.state.bq
+    try:
+        result = await asyncio.to_thread(
+            bq.reconcile_until_amount,
+            transaction_ref=req.transactionRef,
+            target_amount=req.targetAmount,
+            amount_field=req.amountField,
+            order_fields=tuple(req.orderBy),
+            scope_filters=scope,
+            include_anchor=req.includeAnchor,
+            max_rows=req.limit,
+        )
+    except BigQueryError as e:
+        log.error("[%s] %s", req_id, e)
+        raise HTTPException(e.status_code, detail={
+            "requestId": req_id, "error": "bigquery_error", "message": str(e),
+        })
+
+    return {"requestId": req_id, **result}
 
 
 # ---------------------------------------------------------------------------
