@@ -1,27 +1,31 @@
 """
-bq_client.py — BigQuery search client (service account JSON auth).
+bq_client.py — BigQuery search client.
 
 Builds parameterised queries from a whitelisted field map to prevent SQL
-injection. Auth uses a service account JSON file whose path comes from the
-BQ_SERVICE_ACCOUNT_FILE env var.
+injection. Auth uses Application Default Credentials (ADC) — same pattern
+as the Secret Manager client in config.py:
+  - On Cloud Run: ADC auto-resolves to the attached service account.
+  - Locally:      run `gcloud auth application-default login` once.
 
-Cloud Run deployment:
-  - Store the JSON file content as a secret in Secret Manager.
-  - Mount it as a volume in Cloud Run (--set-secrets=/secrets/sa.json=BQ_SA_KEY:latest).
-  - Set BQ_SERVICE_ACCOUNT_FILE=/secrets/sa.json.
-  - The file never lives in git or in the container image.
+No service account JSON file is ever read or required.
 
-Local dev:
-  - Place serviceaccount.json anywhere on disk.
-  - Set BQ_SERVICE_ACCOUNT_FILE=/full/path/to/serviceaccount.json in .env.
+Search surface
+--------------
+1. search(filters, limit)                 — generic equality search (unchanged).
+2. get_by_reference(transaction_ref)      — use case 1: fetch txn(s) by OGTRNO.
+3. reconcile_until_amount(...)            — use case 2: starting from an anchor
+                                            transaction, walk transactions in
+                                            chronological order and return every
+                                            row until the running total of the
+                                            chosen amount field reaches (>=) the
+                                            target amount (inclusive of the row
+                                            that crosses the threshold).
 """
 from __future__ import annotations
 
-import os
-from typing import Any
+from typing import Any, Optional, Sequence
 
 from google.cloud import bigquery
-from google.oauth2 import service_account
 
 import config
 from logger import get_logger
@@ -59,6 +63,15 @@ FIELD_TYPES: dict[str, str] = {
 
 ALLOWED_FIELDS = set(FIELD_TYPES.keys())
 
+# The reference field used for use case 1 and as the reconcile anchor.
+REFERENCE_FIELD = "OGTRNO"
+
+# Numeric amount fields valid for reconciliation.
+AMOUNT_FIELDS = {"OGPYAM", "OGPALE"}
+
+# Default chronological ordering for reconciliation.
+DEFAULT_ORDER_FIELDS: tuple[str, ...] = ("OGCPDT", "OGCPTM")
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -75,7 +88,7 @@ class BigQueryError(Exception):
 # ---------------------------------------------------------------------------
 
 class BigQueryClient:
-    """Thin wrapper around bigquery.Client with parameterised query helper.
+    """Thin wrapper around bigquery.Client with parameterised query helpers.
 
     The underlying google-cloud-bigquery Client is thread-safe and pools
     connections internally, so we keep one instance per process.
@@ -83,22 +96,13 @@ class BigQueryClient:
 
     def __init__(self) -> None:
         self._validate_config()
-
-        creds = service_account.Credentials.from_service_account_file(
-            config.BQ_SERVICE_ACCOUNT_FILE
-        )
-        self._client = bigquery.Client(
-            credentials=creds,
-            project=config.BQ_PROJECT_ID,
-        )
-
+        # ADC handles auth automatically — no credentials= argument needed.
+        self._client = bigquery.Client(project=config.BQ_PROJECT_ID)
         log.info(
-            "BigQueryClient ready | project=%s dataset=%s table=%s "
-            "sa_file=%s cmek=%s",
+            "BigQueryClient ready | project=%s dataset=%s table=%s cmek=%s",
             config.BQ_PROJECT_ID,
             config.BQ_DATASET_ID,
             config.BQ_TABLE_ID,
-            config.BQ_SERVICE_ACCOUNT_FILE,
             "enabled" if config.BQ_KMS_KEY else "disabled",
         )
 
@@ -106,10 +110,9 @@ class BigQueryClient:
     def _validate_config() -> None:
         missing = [
             name for name, val in {
-                "BQ_PROJECT_ID":         config.BQ_PROJECT_ID,
-                "BQ_DATASET_ID":         config.BQ_DATASET_ID,
-                "BQ_TABLE_ID":           config.BQ_TABLE_ID,
-                "BQ_SERVICE_ACCOUNT_FILE": config.BQ_SERVICE_ACCOUNT_FILE,
+                "BQ_PROJECT_ID": config.BQ_PROJECT_ID,
+                "BQ_DATASET_ID": config.BQ_DATASET_ID,
+                "BQ_TABLE_ID":   config.BQ_TABLE_ID,
             }.items() if not val
         ]
         if missing:
@@ -117,17 +120,64 @@ class BigQueryClient:
                 f"BigQueryClient misconfigured — missing env vars: {', '.join(missing)}"
             )
 
-        if not os.path.isfile(config.BQ_SERVICE_ACCOUNT_FILE):
-            raise RuntimeError(
-                f"Service account file not found at: {config.BQ_SERVICE_ACCOUNT_FILE}. "
-                f"Check BQ_SERVICE_ACCOUNT_FILE env var and that the file is mounted/readable."
-            )
-
     def close(self) -> None:
         self._client.close()
 
     # ------------------------------------------------------------------
-    # Search
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def _table_ref(self) -> str:
+        return f"`{config.BQ_PROJECT_ID}.{config.BQ_DATASET_ID}.{config.BQ_TABLE_ID}`"
+
+    def _job_config(self, params: list[bigquery.ScalarQueryParameter]) -> bigquery.QueryJobConfig:
+        kwargs: dict[str, Any] = {"query_parameters": params}
+        if config.BQ_KMS_KEY:
+            kwargs["destination_encryption_configuration"] = (
+                bigquery.EncryptionConfiguration(kms_key_name=config.BQ_KMS_KEY)
+            )
+        return bigquery.QueryJobConfig(**kwargs)
+
+    def _run(self, query: str, params: list[bigquery.ScalarQueryParameter], *, op: str) -> list[dict[str, Any]]:
+        # Log query shape but NOT parameter values (those may be PII).
+        log.info("BQ -> op=%s query=%s | param_count=%d", op, query, len(params))
+        try:
+            job = self._client.query(query, job_config=self._job_config(params))
+            rows = [dict(row) for row in job.result()]
+        except Exception as e:
+            log.exception("BQ query failed (%s): %s", op, e)
+            raise BigQueryError(f"BigQuery query failed: {e}", status_code=500) from e
+        log.info("BQ <- op=%s rows=%d", op, len(rows))
+        return rows
+
+    @staticmethod
+    def _equality_clauses(
+        filters: dict[str, Any],
+        params: list[bigquery.ScalarQueryParameter],
+        *,
+        prefix: str = "",
+    ) -> list[str]:
+        """Build `field = @param` clauses for whitelisted fields only.
+
+        Unknown fields are skipped (defence in depth — the API layer already
+        rejects them). Backticks around field names are safe because the names
+        come from our whitelist, never from user input.
+        """
+        clauses: list[str] = []
+        for field, value in filters.items():
+            if field not in ALLOWED_FIELDS:
+                log.warning("Skipping unknown field: %s", field)
+                continue
+            param_name = f"{prefix}{field}"
+            clauses.append(f"`{field}` = @{param_name}")
+            params.append(
+                bigquery.ScalarQueryParameter(param_name, FIELD_TYPES[field], value)
+            )
+        return clauses
+
+    # ------------------------------------------------------------------
+    # Generic search (unchanged behaviour)
     # ------------------------------------------------------------------
 
     def search(self, filters: dict[str, Any], limit: int) -> list[dict[str, Any]]:
@@ -135,53 +185,186 @@ class BigQueryClient:
 
         Returns a list of dicts (one per row). Raises BigQueryError on failure.
         """
-        where_clauses: list[str] = []
-        query_params: list[bigquery.ScalarQueryParameter] = []
+        params: list[bigquery.ScalarQueryParameter] = []
+        where_clauses = self._equality_clauses(filters, params)
 
-        for field, value in filters.items():
-            if field not in ALLOWED_FIELDS:
-                # Should never happen — Pydantic already enforces this — but
-                # defence in depth.
-                log.warning("Skipping unknown field: %s", field)
-                continue
+        params.append(bigquery.ScalarQueryParameter("row_limit", "INT64", limit))
 
-            param_type = FIELD_TYPES[field]
-            # Backticks around the field name are safe here because the field
-            # comes from our whitelist, not user input.
-            where_clauses.append(f"`{field}` = @{field}")
-            query_params.append(
-                bigquery.ScalarQueryParameter(field, param_type, value)
-            )
-
-        query_params.append(
-            bigquery.ScalarQueryParameter("row_limit", "INT64", limit)
-        )
-
-        table_ref = f"`{config.BQ_PROJECT_ID}.{config.BQ_DATASET_ID}.{config.BQ_TABLE_ID}`"
-        query = f"SELECT * FROM {table_ref}"
+        query = f"SELECT * FROM {self._table_ref}"
         if where_clauses:
             query += " WHERE " + " AND ".join(where_clauses)
         query += " LIMIT @row_limit"
 
-        job_config_kwargs: dict[str, Any] = {"query_parameters": query_params}
-        if config.BQ_KMS_KEY:
-            job_config_kwargs["destination_encryption_configuration"] = (
-                bigquery.EncryptionConfiguration(kms_key_name=config.BQ_KMS_KEY)
-            )
-        job_config = bigquery.QueryJobConfig(**job_config_kwargs)
+        return self._run(query, params, op="search")
 
-        # Log query shape but NOT parameter values (those may be PII).
-        log.info("BQ -> query=%s | param_count=%d limit=%d",
-                 query, len(query_params) - 1, limit)
+    # ------------------------------------------------------------------
+    # Use case 1 — fetch by transaction reference number
+    # ------------------------------------------------------------------
 
-        try:
-            job = self._client.query(query, job_config=job_config)
-            rows = [dict(row) for row in job.result()]
-        except Exception as e:
-            log.exception("BQ query failed: %s", e)
+    def get_by_reference(self, transaction_ref: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Fetch transaction row(s) matching OGTRNO == transaction_ref.
+
+        Returns a list (normally one row, but the table is not guaranteed
+        unique on OGTRNO, so all matches up to `limit` are returned).
+        """
+        if not transaction_ref:
+            raise BigQueryError("transaction_ref must not be empty", status_code=400)
+        return self.search({REFERENCE_FIELD: transaction_ref}, limit=limit)
+
+    # ------------------------------------------------------------------
+    # Use case 2 — reconcile transactions until target amount is reached
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _after_anchor_clause(
+        order_fields: Sequence[str],
+        anchor: dict[str, Any],
+        params: list[bigquery.ScalarQueryParameter],
+        *,
+        include_anchor: bool,
+    ) -> str:
+        """Build a lexicographic "at-or-after the anchor position" predicate.
+
+        For order_fields (f1, f2, ..., fn) this produces:
+            (f1 > a1)
+            OR (f1 = a1 AND f2 > a2)
+            ...
+            OR (f1 = a1 AND ... AND f(n-1) = a(n-1) AND fn >= an)
+        where the final operator is `>` instead of `>=` when include_anchor
+        is False (excluding the exact anchor position).
+        """
+        n = len(order_fields)
+        branches: list[str] = []
+        for i, fi in enumerate(order_fields):
+            parts = [f"`{fj}` = @anchor_{fj}" for fj in order_fields[:i]]
+            last = i == n - 1
+            op = (">" if not include_anchor else ">=") if last else ">"
+            parts.append(f"`{fi}` {op} @anchor_{fi}")
+            branches.append("(" + " AND ".join(parts) + ")")
+
+        for f in order_fields:
+            val = anchor.get(f)
+            if val is None:
+                raise BigQueryError(
+                    f"Anchor transaction is missing ordering field {f!r}; "
+                    f"cannot establish a chronological start point.",
+                    status_code=422,
+                )
+            params.append(bigquery.ScalarQueryParameter(f"anchor_{f}", FIELD_TYPES[f], val))
+
+        return "(" + " OR ".join(branches) + ")"
+
+    def reconcile_until_amount(
+        self,
+        *,
+        transaction_ref: str,
+        target_amount: float,
+        amount_field: str = "OGPYAM",
+        order_fields: Sequence[str] = DEFAULT_ORDER_FIELDS,
+        scope_filters: Optional[dict[str, Any]] = None,
+        include_anchor: bool = True,
+        max_rows: int = 10000,
+    ) -> dict[str, Any]:
+        """Return transactions, starting at the anchor (OGTRNO == transaction_ref)
+        and walking forward in chronological order, until the cumulative sum of
+        `amount_field` reaches or exceeds `target_amount`.
+
+        The row that crosses the threshold IS included. If the available
+        transactions never reach the target, all of them (up to max_rows) are
+        returned and `fully_reconciled` is False.
+
+        scope_filters: optional equality filters (whitelisted fields) to scope
+        the walk — e.g. {"OGBEAC": "<beneficiary acct>", "OGPYCY": "INR"}.
+        Strongly recommended in practice: scope to one account, and always pin a
+        single currency (OGPYCY) since summing across currencies is meaningless.
+        """
+        # ---- validation ----------------------------------------------------
+        if not transaction_ref:
+            raise BigQueryError("transaction_ref must not be empty", status_code=400)
+        if target_amount is None or target_amount <= 0:
+            raise BigQueryError("target_amount must be a positive number", status_code=400)
+        if amount_field not in AMOUNT_FIELDS:
             raise BigQueryError(
-                f"BigQuery query failed: {e}", status_code=500
-            ) from e
+                f"amount_field must be one of {sorted(AMOUNT_FIELDS)}; got {amount_field!r}",
+                status_code=400,
+            )
+        order_fields = tuple(order_fields)
+        if not order_fields:
+            raise BigQueryError("order_fields must not be empty", status_code=400)
+        for f in order_fields:
+            if f not in ALLOWED_FIELDS:
+                raise BigQueryError(f"Unknown order field: {f}", status_code=400)
+        scope_filters = scope_filters or {}
+        for f in scope_filters:
+            if f not in ALLOWED_FIELDS:
+                raise BigQueryError(f"Unknown scope filter field: {f}", status_code=400)
 
-        log.info("BQ <- rows=%d", len(rows))
-        return rows
+        # ---- locate the anchor transaction ---------------------------------
+        anchor_rows = self.get_by_reference(transaction_ref, limit=1)
+        if not anchor_rows:
+            raise BigQueryError(
+                f"No transaction found for reference {transaction_ref!r}",
+                status_code=404,
+            )
+        anchor = anchor_rows[0]
+
+        # ---- build the query -----------------------------------------------
+        params: list[bigquery.ScalarQueryParameter] = []
+
+        after_clause = self._after_anchor_clause(
+            order_fields, anchor, params, include_anchor=include_anchor
+        )
+        scope_clauses = self._equality_clauses(scope_filters, params, prefix="scope_")
+
+        where_sql = " AND ".join([after_clause, *scope_clauses])
+
+        # Deterministic ordering: requested fields + reference as tiebreaker.
+        tiebreaker = [] if REFERENCE_FIELD in order_fields else [REFERENCE_FIELD]
+        order_sql = ", ".join(f"`{f}`" for f in (*order_fields, *tiebreaker))
+
+        amt_expr = f"COALESCE(`{amount_field}`, 0)"
+
+        params.append(bigquery.ScalarQueryParameter("target_amount", "FLOAT64", float(target_amount)))
+        params.append(bigquery.ScalarQueryParameter("row_limit", "INT64", max_rows))
+
+        query = f"""
+            WITH ordered AS (
+                SELECT
+                    t.*,
+                    SUM({amt_expr}) OVER (
+                        ORDER BY {order_sql}
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS running_total
+                FROM {self._table_ref} AS t
+                WHERE {where_sql}
+            )
+            SELECT *
+            FROM ordered
+            -- (running_total - this row's amount) is the cumulative BEFORE this
+            -- row. While that is still below the target, this row is needed —
+            -- which also includes the single row that crosses the threshold.
+            WHERE running_total - {amt_expr} < @target_amount
+            ORDER BY {order_sql}
+            LIMIT @row_limit
+        """.strip()
+
+        rows = self._run(query, params, op="reconcile")
+
+        reconciled = float(rows[-1]["running_total"]) if rows else 0.0
+        fully = reconciled >= float(target_amount)
+        if rows and len(rows) >= max_rows and not fully:
+            log.warning(
+                "reconcile hit max_rows=%d before reaching target; result truncated",
+                max_rows,
+            )
+
+        return {
+            "anchor": anchor,
+            "amount_field": amount_field,
+            "target_amount": float(target_amount),
+            "reconciled_amount": reconciled,
+            "shortfall": max(0.0, float(target_amount) - reconciled),
+            "fully_reconciled": fully,
+            "row_count": len(rows),
+            "rows": rows,
+        }
