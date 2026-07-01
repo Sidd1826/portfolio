@@ -1,17 +1,17 @@
 """
 config.py — Central config.
 
-On Cloud Run: secrets are pulled from GCP Secret Manager at startup.
-Locally: values are loaded from .env via python-dotenv.
+On Cloud Run: secrets are pulled from GCP Secret Manager at startup,
+              BigQuery uses Application Default Credentials (ADC).
+Locally:      values are loaded from .env via python-dotenv.
 
-Secret Manager is only used when GOOGLE_CLOUD_PROJECT is set (i.e. on GCP).
-Locally it falls back to .env / os.environ as before — no GCP credentials needed.
+Secret Manager is only contacted when GOOGLE_CLOUD_PROJECT is set (i.e. on
+GCP). Locally it falls back to .env / os.environ — no GCP credentials needed.
 """
 from __future__ import annotations
 
 import os
 
-# Load .env for local dev (no-op on Cloud Run)
 try:
     from dotenv import load_dotenv
     load_dotenv(override=False)
@@ -35,15 +35,11 @@ def _env_int(name: str, default: int) -> int:
 
 # ---------------------------------------------------------------------------
 # Secret Manager — only runs on GCP (when GOOGLE_CLOUD_PROJECT is set).
-# Pulls each secret by name and injects into os.environ so the rest of
-# config.py can read them with plain os.getenv() calls — no other file changes.
 # ---------------------------------------------------------------------------
 
 def _load_secrets_from_gcp() -> None:
-    """Pull all secrets from Secret Manager and set them into os.environ."""
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
     if not project_id:
-        # Not on GCP — use .env / os.environ as-is
         return
 
     try:
@@ -56,19 +52,15 @@ def _load_secrets_from_gcp() -> None:
 
     client = secretmanager.SecretManagerServiceClient()
 
-    # Map: env var name -> Secret Manager secret name
-    # The secret name must match exactly what you created in Secret Manager.
     secrets_to_load = {
-        "UPI_USERNAME":                           "UPI_USERNAME",
-        "UPI_PASSWORD":                           "UPI_PASSWORD",
-        "UPI_AES_KEY_HEX":                        "UPI_AES_KEY_HEX",
-        "HSBC_TRUST_TOKEN_TRANSACTION_HISTORY":   "HSBC_TRUST_TOKEN_TRANSACTION_HISTORY",
-        "HSBC_TRUST_TOKEN_APPLY_HOLD":            "HSBC_TRUST_TOKEN_APPLY_HOLD",
-        "HSBC_TRUST_TOKEN_DEMAND_DEPOSIT":        "HSBC_TRUST_TOKEN_DEMAND_DEPOSIT",
+        "UPI_USERNAME":              "UPI_USERNAME",
+        "UPI_PASSWORD":              "UPI_PASSWORD",
+        "UPI_AES_KEY_HEX":           "UPI_AES_KEY_HEX",
+        "HSBC_TOKEN_USERNAME":       "HSBC_TOKEN_USERNAME",
+        "HSBC_TOKEN_PASSWORD":       "HSBC_TOKEN_PASSWORD",
     }
 
     for env_var, secret_name in secrets_to_load.items():
-        # Skip if already set (allows override via --set-env-vars if ever needed)
         if os.environ.get(env_var):
             continue
         try:
@@ -76,14 +68,11 @@ def _load_secrets_from_gcp() -> None:
             response = client.access_secret_version(request={"name": secret_path})
             os.environ[env_var] = response.payload.data.decode("utf-8").strip()
         except Exception as e:
-            # Raise loudly — a missing secret should crash startup, not silently
-            # run with an empty value which causes confusing downstream errors.
             raise RuntimeError(
                 f"Failed to load secret '{secret_name}' from Secret Manager: {e}"
             ) from e
 
 
-# Pull secrets before reading any config values below
 _load_secrets_from_gcp()
 
 
@@ -113,7 +102,7 @@ TOKEN_DEFAULT_TTL_SEC:    int = _env_int("TOKEN_DEFAULT_TTL_SEC", 900)
 
 
 # ---------------------------------------------------------------------------
-# HSBC Hub endpoints (non-sensitive — set as plain env vars on Cloud Run)
+# HSBC Hub endpoints
 # ---------------------------------------------------------------------------
 
 HSBC_TRANSACTION_HISTORY_URL: str = _env(
@@ -134,19 +123,25 @@ HSBC_DEMAND_DEPOSIT_URL: str = _env(
     "apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc/api/v5/accounts/demand-deposit-account",
 )
 
-
 # ---------------------------------------------------------------------------
-# HSBC E2E Trust Tokens (pulled from Secret Manager above)
+# HSBC E2E Trust Token — generated dynamically via the token-translator.
+# One token is shared by all three HSBC APIs. It expires in ~60s, so the
+# HSBCHubClient caches it and refreshes shortly before expiry.
 # ---------------------------------------------------------------------------
 
-HSBC_TRUST_TOKEN_TRANSACTION_HISTORY: str = _env("HSBC_TRUST_TOKEN_TRANSACTION_HISTORY", "")
-HSBC_TRUST_TOKEN_APPLY_HOLD:          str = _env("HSBC_TRUST_TOKEN_APPLY_HOLD", "")
-HSBC_TRUST_TOKEN_DEMAND_DEPOSIT:      str = _env("HSBC_TRUST_TOKEN_DEMAND_DEPOSIT", "")
+HSBC_TOKEN_URL: str = _env(
+    "HSBC_TOKEN_URL",
+    "https://cmb-ib2b-dsp-pprod-ap.hk.hsbc:8443/dsp/rest-sts/DSP_iB2B/iB2B_tokenTranslator_v2",
+)
 
+# SECRET — credentials exchanged for a JWT (from Secret Manager on GCP)
+HSBC_TOKEN_USERNAME: str = _env("HSBC_TOKEN_USERNAME", "")
+HSBC_TOKEN_PASSWORD: str = _env("HSBC_TOKEN_PASSWORD", "")
 
-# ---------------------------------------------------------------------------
-# Static correlation IDs
-# ---------------------------------------------------------------------------
+# Token lifetime is 60s. Refresh this many seconds BEFORE expiry to avoid
+# using a token that dies mid-request.
+HSBC_TOKEN_TTL_SEC:           int = _env_int("HSBC_TOKEN_TTL_SEC", 60)
+HSBC_TOKEN_REFRESH_LEEWAY_SEC: int = _env_int("HSBC_TOKEN_REFRESH_LEEWAY_SEC", 10)
 
 HSBC_REQUEST_CORRELATION_ID: str = _env(
     "HSBC_REQUEST_CORRELATION_ID",
@@ -157,3 +152,20 @@ HSBC_SESSION_CORRELATION_ID: str = _env(
     "HSBC_SESSION_CORRELATION_ID",
     "session-12345-abc",
 )
+
+
+# ---------------------------------------------------------------------------
+# BigQuery — auth via service account JSON file, identifiers from env
+# ---------------------------------------------------------------------------
+
+BQ_PROJECT_ID: str = _env("BQ_PROJECT_ID", "")
+BQ_DATASET_ID: str = _env("BQ_DATASET_ID", "")
+BQ_TABLE_ID:   str = _env("BQ_TABLE_ID",   "")
+
+# Path to the service account JSON.
+# Local dev:  /full/path/to/serviceaccount.json
+# Cloud Run:  /secrets/sa.json  (mounted via --set-secrets from Secret Manager)
+BQ_SERVICE_ACCOUNT_FILE: str = _env("BQ_SERVICE_ACCOUNT_FILE", "")
+
+# Optional CMEK — leave empty unless your dataset requires it.
+BQ_KMS_KEY: str = _env("BQ_KMS_KEY", "")

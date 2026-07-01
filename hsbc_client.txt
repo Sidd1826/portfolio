@@ -10,6 +10,8 @@ No proxy — these are internal HSBC endpoints reachable directly.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -40,6 +42,111 @@ class HSBCError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Token manager — fetches & caches the E2E trust token (JWT) shared by all
+# three HSBC APIs. Token lives ~60s, so we refresh just before expiry.
+# Thread-safe: HSBC calls run in a threadpool (asyncio.to_thread), so a
+# double-checked lock ensures only one thread refreshes at a time.
+# ---------------------------------------------------------------------------
+
+class _TokenManager:
+    def __init__(self, session: requests.Session) -> None:
+        self._session = session
+        self._token: Optional[str] = None
+        self._expires_at: float = 0.0
+        self._lock = threading.Lock()
+
+    def _is_valid(self) -> bool:
+        # Valid if we have a token and it won't expire within the leeway window.
+        return bool(self._token) and (
+            self._expires_at - config.HSBC_TOKEN_REFRESH_LEEWAY_SEC > time.time()
+        )
+
+    def get_token(self, *, force_refresh: bool = False) -> str:
+        if not force_refresh and self._is_valid():
+            return self._token  # type: ignore[return-value]
+
+        with self._lock:
+            # Double-check inside the lock — another thread may have refreshed.
+            if not force_refresh and self._is_valid():
+                return self._token  # type: ignore[return-value]
+            self._refresh_locked()
+            return self._token  # type: ignore[return-value]
+
+    def _refresh_locked(self) -> None:
+        if not config.HSBC_TOKEN_USERNAME or not config.HSBC_TOKEN_PASSWORD:
+            raise HSBCError(
+                "Token credentials missing (HSBC_TOKEN_USERNAME/HSBC_TOKEN_PASSWORD)",
+                status_code=500,
+            )
+
+        body = {
+            "input_token_state": {
+                "token_type": "CREDENTIAL",
+                "username":   config.HSBC_TOKEN_USERNAME,
+                "password":   config.HSBC_TOKEN_PASSWORD,
+            },
+            "output_token_state": {
+                "token_type": "JWT",
+            },
+        }
+
+        log.info("HSBC token -> refreshing (translator)")
+        try:
+            resp = self._session.post(
+                config.HSBC_TOKEN_URL,
+                json=body,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                timeout=(config.HTTP_CONNECT_TIMEOUT, config.HTTP_READ_TIMEOUT),
+            )
+        except requests.exceptions.RequestException as e:
+            log.error("HSBC token network error: %s", e)
+            raise HSBCError(f"Token translator network error: {e}", status_code=502) from e
+
+        if not resp.ok:
+            log.error("HSBC token failed status=%d body=%s", resp.status_code, resp.text[:500])
+            raise HSBCError(
+                f"Token translator returned {resp.status_code}",
+                status_code=502, upstream_status=resp.status_code,
+            )
+
+        token = self._extract_token(resp)
+        if not token:
+            raise HSBCError("Token translator response did not contain a JWT", status_code=502)
+
+        self._token = token
+        self._expires_at = time.time() + config.HSBC_TOKEN_TTL_SEC
+        log.info("HSBC token <- ok (ttl=%ds)", config.HSBC_TOKEN_TTL_SEC)
+
+    @staticmethod
+    def _extract_token(resp: requests.Response) -> Optional[str]:
+        """Pull the JWT out of the translator response, tolerating shapes:
+        - JSON: {"access_token": "..."} / {"token": "..."} / {"issued_token": "..."} /
+                {"output_token": "..."} / nested {"output_token_state": {"token": "..."}}
+        - Plain text body that is the JWT itself.
+        """
+        try:
+            data = resp.json()
+        except ValueError:
+            text = resp.text.strip()
+            return text or None
+
+        if isinstance(data, dict):
+            for key in ("access_token", "token", "issued_token", "output_token", "jwt", "id_token"):
+                v = data.get(key)
+                if isinstance(v, str) and v:
+                    return v
+            nested = data.get("output_token_state")
+            if isinstance(nested, dict):
+                for key in ("token", "access_token", "issued_token", "jwt"):
+                    v = nested.get(key)
+                    if isinstance(v, str) and v:
+                        return v
+        elif isinstance(data, str) and data:
+            return data
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
 
@@ -49,6 +156,7 @@ class HSBCHubClient:
     def __init__(self) -> None:
         self._validate_config()
         self._session = self._build_session()
+        self._tokens = _TokenManager(self._session)
 
     @staticmethod
     def _validate_config() -> None:
@@ -56,6 +164,7 @@ class HSBCHubClient:
             "HSBC_TRANSACTION_HISTORY_URL": config.HSBC_TRANSACTION_HISTORY_URL,
             "HSBC_APPLY_HOLD_URL":          config.HSBC_APPLY_HOLD_URL,
             "HSBC_DEMAND_DEPOSIT_URL":      config.HSBC_DEMAND_DEPOSIT_URL,
+            "HSBC_TOKEN_URL":               config.HSBC_TOKEN_URL,
         }
 
         for name, url in checks.items():
@@ -112,7 +221,7 @@ class HSBCHubClient:
     # Per-endpoint header builders
     # ------------------------------------------------------------------
 
-    def _headers_transaction_history(self, sensitive_data: str) -> dict[str, str]:
+    def _headers_transaction_history(self, sensitive_data: str, token: str) -> dict[str, str]:
         return {
             "X-HSBC-CB-Staff-User-Id":              "DMS1",
             "X-HSBC-Chnl-CountryCode":              "IN",
@@ -120,7 +229,7 @@ class HSBCHubClient:
             "X-HSBC-Client-Id":                     "SBI",
             "X-HSBC-Client-Secret":                 "SBI1",
             "X-HSBC-Consumer-Id":                   "INHSBC_HUB_DMS",
-            "X-HSBC-E2E-Trust-Token":               config.HSBC_TRUST_TOKEN_TRANSACTION_HISTORY,
+            "X-HSBC-E2E-Trust-Token":               token,
             "X-HSBC-GBGF":                          "RBWM",
             "X-HSBC-Global-Channel-Id":             "OHB",
             "X-HSBC-Request-Correlation-Id":        config.HSBC_REQUEST_CORRELATION_ID,
@@ -132,7 +241,7 @@ class HSBCHubClient:
             "X-HSBC-Workstation-Id":                "DMS1",
         }
 
-    def _headers_apply_hold(self) -> dict[str, str]:
+    def _headers_apply_hold(self, token: str) -> dict[str, str]:
         return {
             "Content-Type":                         "application/json",
             "X-HSBC-CB-Client-Id":                  "SBI",
@@ -141,7 +250,7 @@ class HSBCHubClient:
             "X-HSBC-Chnl-CountryCode":              "IN",
             "X-HSBC-Chnl-Group-Member":             "HSBC",
             "X-HSBC-Consumer-Id":                   "INHSBC_HUB_MHA",
-            "X-HSBC-E2E-Trust-Token":               config.HSBC_TRUST_TOKEN_APPLY_HOLD,
+            "X-HSBC-E2E-Trust-Token":               token,
             "X-HSBC-GBGF":                          "WPB",
             "X-HSBC-Global-Channel-Id":             "STAFFWEB",
             "X-HSBC-Request-Correlation-Id":        config.HSBC_REQUEST_CORRELATION_ID,
@@ -154,7 +263,7 @@ class HSBCHubClient:
             "X-HSBC-Workstation-Id":                "API9",
         }
 
-    def _headers_demand_deposit(self, sensitive_data: str) -> dict[str, str]:
+    def _headers_demand_deposit(self, sensitive_data: str, token: str) -> dict[str, str]:
         return {
             "Content-Type":                         "application/json",
             "HSBC-CLIENT-IP":                       "255.255.222.222",
@@ -165,7 +274,7 @@ class HSBCHubClient:
             "X-HSBC-Client-Id":                     "SBI11",
             "X-HSBC-Client-Secret":                 "WEB",
             "X-HSBC-Consumer-Id":                   "INHSBC_HUB_MHA",
-            "X-HSBC-E2E-Trust-Token":               config.HSBC_TRUST_TOKEN_DEMAND_DEPOSIT,
+            "X-HSBC-E2E-Trust-Token":               token,
             "X-HSBC-GBGF":                          "RBWM",
             "X-HSBC-Global-Channel-Id":             "MOBILE",
             "X-HSBC-Request-Correlation-Id":        config.HSBC_REQUEST_CORRELATION_ID,
@@ -200,7 +309,7 @@ class HSBCHubClient:
         return self._do(
             method="GET",
             url=config.HSBC_TRANSACTION_HISTORY_URL,
-            headers=self._headers_transaction_history(sensitive_data),
+            headers_factory=lambda tok: self._headers_transaction_history(sensitive_data, tok),
             params=params,
             op="transaction_history",
         )
@@ -215,7 +324,7 @@ class HSBCHubClient:
         return self._do(
             method="POST",
             url=config.HSBC_APPLY_HOLD_URL,
-            headers=self._headers_apply_hold(),
+            headers_factory=lambda tok: self._headers_apply_hold(tok),
             json_body=body,
             op="apply_hold",
         )
@@ -239,7 +348,7 @@ class HSBCHubClient:
         return self._do(
             method="GET",
             url=config.HSBC_DEMAND_DEPOSIT_URL,
-            headers=self._headers_demand_deposit(sensitive_data),
+            headers_factory=lambda tok: self._headers_demand_deposit(sensitive_data, tok),
             params=params,
             op="demand_deposit",
         )
@@ -253,11 +362,16 @@ class HSBCHubClient:
         *,
         method: str,
         url: str,
-        headers: dict[str, str],
+        headers_factory,
         op: str,
         params:    Optional[dict[str, Any]] = None,
         json_body: Optional[dict[str, Any]] = None,
+        _retry_on_401: bool = True,
     ) -> dict[str, Any]:
+        # Fetch (cached) token and build headers fresh for this attempt.
+        token = self._tokens.get_token()
+        headers = headers_factory(token)
+
         safe_url = f"{url}?{urlencode(params)}" if params else url
         log.info("HSBC -> %s %s", method, safe_url)
 
@@ -282,6 +396,16 @@ class HSBCHubClient:
         except requests.exceptions.RequestException as e:
             log.error("HSBC %s network error: %s", op, e)
             raise HSBCError(f"Network error: {e}", status_code=502) from e
+
+        # Token may have expired mid-flight — refresh once and retry.
+        if resp.status_code in (401, 403) and _retry_on_401:
+            log.warning("HSBC %s got %d — forcing token refresh & retrying once",
+                        op, resp.status_code)
+            self._tokens.get_token(force_refresh=True)
+            return self._do(
+                method=method, url=url, headers_factory=headers_factory, op=op,
+                params=params, json_body=json_body, _retry_on_401=False,
+            )
 
         log.info("HSBC <- %s %s status=%d", method, op, resp.status_code)
 
