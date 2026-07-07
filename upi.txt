@@ -1,5 +1,14 @@
 """
-upi.py - AES-128-ECB cipher + HSBC UPI client (async, httpx).
+upi.py — HSBC UPI client (AES-128-ECB hex I/O + bearer-token login).
+
+Wraps HSBC's two-step UPI API:
+  1. POST /sha/api/auth/login    -> bearer token
+  2. POST /mha/secure/sha/check  -> AES-encrypted hex payload, AES-encrypted hex response
+
+Encryption: AES-128-ECB, PKCS5/PKCS7 padding, hex key, uppercase hex I/O.
+
+Kept logic-identical to the original single-file working version — only
+broken out into its own module and pointed at config.py / logger.py.
 """
 from __future__ import annotations
 
@@ -18,154 +27,221 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import config
 from logger import get_logger
 
-log = get_logger(__name__)
+logger = get_logger("upi")
 
+
+# -------------------- AES crypto --------------------
 
 class CryptoError(Exception):
-    pass
+    """Any encryption/decryption failure."""
 
-
-class UPIError(Exception):
-    def __init__(self, msg: str, status_code: int = 502, upstream_status: Optional[int] = None):
-        super().__init__(msg)
-        self.status_code     = status_code
-        self.upstream_status = upstream_status
-
-
-# ---------------------------------------------------------------------------
-# AES-128 / ECB / PKCS7  (Java AES/ECB/PKCS5Padding compatible)
-# ---------------------------------------------------------------------------
 
 class AESCipher:
-    KEY_BYTES   = 16
-    BLOCK_BITS  = 128
+    """AES-128-ECB with PKCS7 padding, hex I/O. PKCS5Padding == PKCS7 for AES."""
+
+    BLOCK_BITS = 128
     BLOCK_BYTES = 16
+    KEY_BYTES = 16  # AES-128
 
     def __init__(self, key_hex: str) -> None:
         if not key_hex:
-            raise CryptoError("UPI_AES_KEY_HEX is not set")
+            raise CryptoError("AES key not configured (set UPI_AES_KEY_HEX)")
         try:
             key = bytes.fromhex(key_hex.strip())
         except ValueError as e:
-            raise CryptoError(f"UPI_AES_KEY_HEX is not valid hex: {e}") from e
+            raise CryptoError(f"AES key is not valid hex: {e}") from e
         if len(key) != self.KEY_BYTES:
-            raise CryptoError(f"AES key must be {self.KEY_BYTES} bytes, got {len(key)}")
+            raise CryptoError(
+                f"AES key must be {self.KEY_BYTES} bytes ({self.KEY_BYTES*2} hex chars), got {len(key)}"
+            )
         self._key = key
 
-    def encrypt(self, payload: dict[str, Any]) -> str:
-        pt      = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
-        padder  = padding.PKCS7(self.BLOCK_BITS).padder()
-        padded  = padder.update(pt) + padder.finalize()
-        enc     = Cipher(algorithms.AES(self._key), modes.ECB()).encryptor()
-        return (enc.update(padded) + enc.finalize()).hex().upper()
+    def encrypt_json(self, payload: dict[str, Any]) -> str:
+        plaintext = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        padder = padding.PKCS7(self.BLOCK_BITS).padder()
+        padded = padder.update(plaintext) + padder.finalize()
+        encryptor = Cipher(algorithms.AES(self._key), modes.ECB()).encryptor()
+        return (encryptor.update(padded) + encryptor.finalize()).hex().upper()
 
-    def decrypt(self, hex_ct: str) -> dict[str, Any]:
-        cleaned = "".join(hex_ct.split())
+    def decrypt_json(self, ciphertext_hex: str) -> dict[str, Any]:
+        cleaned = "".join(ciphertext_hex.split())  # tolerate whitespace/newlines
         try:
             ct = bytes.fromhex(cleaned)
         except (ValueError, binascii.Error) as e:
-            raise CryptoError(f"Not valid hex: {e}") from e
+            raise CryptoError(f"Ciphertext is not valid hex: {e}") from e
         if not ct or len(ct) % self.BLOCK_BYTES != 0:
-            raise CryptoError("Ciphertext length invalid")
+            raise CryptoError(f"Ciphertext length must be a non-zero multiple of {self.BLOCK_BYTES}")
         try:
-            dec      = Cipher(algorithms.AES(self._key), modes.ECB()).decryptor()
-            padded   = dec.update(ct) + dec.finalize()
+            decryptor = Cipher(algorithms.AES(self._key), modes.ECB()).decryptor()
+            padded = decryptor.update(ct) + decryptor.finalize()
             unpadder = padding.PKCS7(self.BLOCK_BITS).unpadder()
-            plain    = unpadder.update(padded) + unpadder.finalize()
+            plaintext = unpadder.update(padded) + unpadder.finalize()
         except ValueError as e:
             raise CryptoError("Decryption failed (bad padding or wrong key)") from e
         try:
-            return json.loads(plain.decode("utf-8"))
+            return json.loads(plaintext.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            raise CryptoError(f"Decrypted bytes not valid JSON: {e}") from e
+            raise CryptoError(f"Decrypted payload is not valid JSON: {e}") from e
 
 
-# ---------------------------------------------------------------------------
-# UPI Client
-# ---------------------------------------------------------------------------
+# -------------------- token cache --------------------
 
 @dataclass
-class _Token:
+class _CachedToken:
     value: str
     expires_at: float
 
-def _jwt_exp(jwt: str) -> Optional[float]:
+
+def _parse_jwt_exp(jwt: str) -> Optional[float]:
+    """Read `exp` from JWT payload without verifying signature. Returns None if not parseable."""
     try:
         parts = jwt.split(".")
         if len(parts) != 3:
             return None
-        b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        return float(json.loads(base64.urlsafe_b64decode(b64)).get("exp", 0)) or None
-    except Exception:
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload_b64)).get("exp")
+        return float(exp) if exp is not None else None
+    except (ValueError, json.JSONDecodeError, KeyError):
         return None
 
 
+# -------------------- UPI client --------------------
+
+class UPIError(Exception):
+    def __init__(self, message: str, status_code: int = 502, upstream_status: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.upstream_status = upstream_status
+
+
 class UPIClient:
+    """Async, concurrency-safe HSBC UPI client. Handles login + secure-call orchestration."""
+
     def __init__(self, http: httpx.AsyncClient, cipher: AESCipher) -> None:
-        self._http       = http
-        self._cipher     = cipher
+        self._http = http
+        self._cipher = cipher
         self._login_url  = f"{config.UPI_BASE_URL.rstrip('/')}{config.UPI_LOGIN_PATH}"
         self._secure_url = f"{config.UPI_BASE_URL.rstrip('/')}{config.UPI_SECURE_PATH}"
-        self._token: Optional[_Token] = None
-        self._lock       = asyncio.Lock()
+        self._token: Optional[_CachedToken] = None
+        self._token_lock = asyncio.Lock()
 
     async def send_secure(self, payload: dict[str, Any]) -> dict[str, Any]:
-        encrypted     = self._cipher.encrypt(payload)
-        response_body = await self._post_secure(encrypted, retry_on_401=True)
+        """Encrypt -> POST /secure -> decrypt. Retries once on 401."""
+        encrypted = self._cipher.encrypt_json(payload)
+        body = await self._post_secure(encrypted, retry_on_401=True)
         for key in ("responseMsg", "response_msg", "data", "result"):
-            v = response_body.get(key)
+            v = body.get(key)
             if isinstance(v, str) and v:
-                return self._cipher.decrypt(v)
-        raise UPIError(f"No encrypted field in response. Keys: {list(response_body.keys())}")
+                return self._cipher.decrypt_json(v)
+        raise UPIError(f"Secure response missing encrypted msg. Keys: {list(body.keys())}")
 
     async def _get_token(self) -> str:
-        tok = self._token
-        if tok and tok.expires_at - config.TOKEN_REFRESH_LEEWAY > time.time():
-            return tok.value
-        async with self._lock:
-            tok = self._token
-            if tok and tok.expires_at - config.TOKEN_REFRESH_LEEWAY > time.time():
-                return tok.value
-            log.info("Fetching UPI auth token")
+        """Return cached token or fetch fresh. Double-checked lock so only one login under concurrent load."""
+        token = self._token
+        if token and token.expires_at - config.TOKEN_REFRESH_LEEWAY_SEC > time.time():
+            return token.value
+
+        async with self._token_lock:
+            token = self._token
+            if token and token.expires_at - config.TOKEN_REFRESH_LEEWAY_SEC > time.time():
+                return token.value
+
+            logger.info("Refreshing auth token")
             value = await self._login()
-            self._token = _Token(value=value, expires_at=_jwt_exp(value) or time.time() + config.TOKEN_DEFAULT_TTL)
+            expires_at = _parse_jwt_exp(value) or (time.time() + config.TOKEN_DEFAULT_TTL_SEC)
+            self._token = _CachedToken(value=value, expires_at=expires_at)
             return value
 
     async def _login(self) -> str:
+        # Encrypt the credentials with the SAME AES cipher used for secure calls,
+        # then send as {"requestMsg": "<HEX>"} — same envelope as /secure.
+        login_payload = {"username": config.UPI_USERNAME, "password": config.UPI_PASSWORD}
+        try:
+            encrypted_creds = self._cipher.encrypt_json(login_payload)
+        except CryptoError as e:
+            raise UPIError(f"Failed to encrypt login credentials: {e}") from e
+
         try:
             resp = await self._http.post(
                 self._login_url,
-                json={"username": config.UPI_USERNAME, "password": config.UPI_PASSWORD},
-                headers={"Content-Type": "application/json"},
+                json={"requestMsg": encrypted_creds},
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
             )
         except httpx.HTTPError as e:
             raise UPIError(f"Login network error: {type(e).__name__}") from e
-        if resp.status_code != 200:
-            raise UPIError(f"Login failed HTTP {resp.status_code}", upstream_status=resp.status_code)
-        data = resp.json()
-        for src in [data, data.get("data") or {}]:
-            if isinstance(src, dict):
-                for k in ("token", "access_token", "accessToken", "authToken"):
-                    v = src.get(k)
-                    if isinstance(v, str) and v:
-                        return v
-        raise UPIError("No token in login response")
 
-    async def _post_secure(self, hex_payload: str, retry_on_401: bool) -> dict[str, Any]:
+        if resp.status_code != 200:
+            logger.error("Login failed status=%d body=%s", resp.status_code, resp.text[:300])
+            raise UPIError(f"Login failed with status {resp.status_code}", upstream_status=resp.status_code)
+
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise UPIError("Login response was not valid JSON") from e
+
+        # Response may itself be encrypted (like /secure) or plain JSON — handle both.
+        # First, if there's an encrypted envelope, decrypt it and look inside.
+        for env_key in ("responseMsg", "response_msg", "data", "result"):
+            v = data.get(env_key)
+            if isinstance(v, str) and v and self._looks_like_hex(v):
+                try:
+                    data = self._cipher.decrypt_json(v)
+                except CryptoError:
+                    pass  # not an encrypted envelope after all — fall through
+                break
+
+        # Tolerant token lookup — HSBC envs vary on key naming.
+        token = self._extract_token(data)
+        if token:
+            return token
+        raise UPIError("Login response did not contain a token")
+
+    @staticmethod
+    def _looks_like_hex(s: str) -> bool:
+        s = s.strip()
+        return len(s) >= 32 and len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s)
+
+    @staticmethod
+    def _extract_token(data: dict[str, Any]) -> Optional[str]:
+        for key in ("token", "access_token", "accessToken", "authToken", "id_token"):
+            v = data.get(key)
+            if isinstance(v, str) and v:
+                return v
+        nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+        for key in ("token", "access_token", "accessToken", "authToken", "id_token"):
+            v = nested.get(key)
+            if isinstance(v, str) and v:
+                return v
+        return None
+
+    async def _post_secure(self, encrypted_hex: str, retry_on_401: bool) -> dict[str, Any]:
         token = await self._get_token()
         try:
             resp = await self._http.post(
                 self._secure_url,
-                json={"requestMsg": hex_payload},
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"requestMsg": encrypted_hex},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
             )
         except httpx.HTTPError as e:
             raise UPIError(f"Secure endpoint network error: {type(e).__name__}") from e
+
         if resp.status_code == 401 and retry_on_401:
-            log.warning("401 on secure call — refreshing token")
-            async with self._lock:
+            logger.warning("Got 401, invalidating token & retrying")
+            async with self._token_lock:
                 self._token = None
-            return await self._post_secure(hex_payload, retry_on_401=False)
+            return await self._post_secure(encrypted_hex, retry_on_401=False)
+
         if resp.status_code != 200:
-            raise UPIError(f"Secure endpoint HTTP {resp.status_code}", upstream_status=resp.status_code)
-        return resp.json()
+            logger.error("Secure failed status=%d body=%s", resp.status_code, resp.text[:300])
+            raise UPIError(
+                f"Secure endpoint failed with status {resp.status_code}",
+                upstream_status=resp.status_code,
+            )
+        try:
+            return resp.json()
+        except ValueError as e:
+            raise UPIError("Secure response was not valid JSON") from e
