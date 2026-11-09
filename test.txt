@@ -1,0 +1,22 @@
+This year, I owned the end-to-end delivery of four business and regulatory platforms at HSBC, from development through deployment and production support. The work spanned React, Flask, Azure, Microsoft Power Platform and Google Cloud.
+
+I built the **DoT FRI & MNRL platform** single-handedly. It replaced a process that depended on a central team and Excel with secure self-service access for IWPB and CIB. Export turnaround fell from 2–3 hours to around 35–40 seconds. Customer Matchoff against ~30 lakh records used to be a manual exercise and now produces a reconciled report in 2–3 minutes. Phase 1 went live on 14 May and Phase 2 on 1 September, with full audit trails that strengthen RBI compliance. Phase 3 is now in progress.
+
+For **MHA**, I delivered the cyber-fraud complaint integration with the 1930 Helpline and CFCFRMS on GCP. It validates transactions, places full or partial holds and traces onward money trails. An asynchronous scheduler processes each complaint within 1–2 minutes. Phase 1 covers UPI and Internet Banking, which account for most fraud volume, and is technically live in production. I am now extending it to IMPS and Cards.
+
+I developed and deployed **Semicon**, which has run in production for a year with zero reported issues. It supports around 80 users and large client payment volumes under Maker-Checker control. I was also the first in the team to integrate Python with Dataverse. The business initiative Semicon supports received HSBC's Champions Award.
+
+On the **Mail Receiving System**, I delivered around 80% of the development on Power Platform. It is live at Mumbai NESCO and rolls out to all locations this month, with an expected 14,000 records per month.
+
+Beyond my core projects, I:
+- own the Cloud Run and GKE deployment pipelines for HIFSL and guide its vendor teams on GCP
+- am upgrading the 2019 Business Resilience Risk utility and managing its stakeholders
+- handled the transformation team's vendor deployments in Ninad's absence
+
+These contributions were recognised at the GCOO and GCIO Townhalls and with the Simplify & Transform Award at the annual Conclave. I have also made significant progress in my communication and now work directly with business stakeholders and vendors. I am preparing for the CKA exam in December.
+
+Next year, I aim to take on larger initiatives, deepen my cloud expertise, and represent HSBC at events within and outside the Bank.
+
+---
+
+This comes to about 390 words. I left out the AI hackathon because it wasn't in your own notes. I can add it back if you want it.
