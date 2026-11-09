@@ -1,0 +1,11 @@
+This year, I owned the end-to-end delivery of four business and regulatory platforms, from development through deployment and support, across Azure, Power Platform and Google Cloud.
+
+I built the **DoT FRI & MNRL platform** single-handedly. It gives IWPB and CIB secure self-service access and cuts export turnaround from 2–3 hours to around 35–40 seconds. Customer Matchoff against ~30 lakh records went from a manual process to a 2–3 minute reconciled report. Phases 1 and 2 are live, with full audit trails supporting RBI compliance, and Phase 3 is in progress.
+
+For **MHA**, I delivered the cyber-fraud complaint integration on GCP. It processes each complaint within 1–2 minutes, including transaction validation, fund holds and money-trail tracing. Phase 1 (UPI and Internet Banking) is technically live, and I am now adding IMPS and Cards.
+
+**Semicon**, which I developed and deployed, has run in production for a year with zero reported issues and supports around 80 users under Maker-Checker control. The business initiative it supports received HSBC's Champions Award. I delivered around 80% of the **Mail Receiving System**, now live at Mumbai NESCO and rolling out to all locations this month.
+
+I also own the GCP deployment pipelines for HIFSL and guide its vendors. I am upgrading the Business Resilience Risk utility and handled the transformation team's deployments when cover was needed.
+
+This work was recognised at the GCOO and GCIO Townhalls and with the Simplify & Transform Award. I have strengthened my communication and am preparing for the CKA exam. Next year, I aim to lead larger initiatives and represent HSBC more widely.
